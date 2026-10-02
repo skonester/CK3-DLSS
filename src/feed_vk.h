@@ -46,6 +46,7 @@ struct FeedVk
     PFN_vkCmdPipelineBarrier          CmdPipelineBarrier;
     PFN_vkCmdCopyImage                CmdCopyImage;
     PFN_vkCmdBlitImage                CmdBlitImage;
+    PFN_vkCmdClearColorImage          CmdClearColorImage;
 
     bool ok;
 };
@@ -77,6 +78,7 @@ static bool FeedVkLoad(FeedVk *vk, VkDevice device)
     FEED_VK_GET(CmdPipelineBarrier,          "vkCmdPipelineBarrier")
     FEED_VK_GET(CmdCopyImage,                "vkCmdCopyImage")
     FEED_VK_GET(CmdBlitImage,                "vkCmdBlitImage")
+    FEED_VK_GET(CmdClearColorImage,          "vkCmdClearColorImage")
     #undef FEED_VK_GET
 
     vk->ok = true;
@@ -221,6 +223,41 @@ static void FeedVkBlitImage(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImage
     bl.srcOffsets[1]  = { static_cast<int32_t>(w), static_cast<int32_t>(h), 1 };
     bl.dstOffsets[1]  = { static_cast<int32_t>(w), static_cast<int32_t>(h), 1 };
     vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_NEAREST);
+}
+
+// Region variants (portrait atlas): copy / blit a w x h block between arbitrary offsets.
+static void FeedVkCopyRegion(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
+                             VkImage dst, VkImageLayout dst_layout, int sx, int sy, int dx, int dy, UINT w, UINT h)
+{
+    VkImageCopy c = {};
+    c.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    c.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    c.srcOffset      = { sx, sy, 0 };
+    c.dstOffset      = { dx, dy, 0 };
+    c.extent         = { w, h, 1 };
+    vk->CmdCopyImage(cb, src, src_layout, dst, dst_layout, 1, &c);
+}
+
+static void FeedVkBlitRegion(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
+                             VkImage dst, VkImageLayout dst_layout, int sx, int sy, int dx, int dy, UINT w, UINT h)
+{
+    VkImageBlit bl = {};
+    bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    bl.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    bl.srcOffsets[0]  = { sx, sy, 0 };
+    bl.srcOffsets[1]  = { sx + static_cast<int32_t>(w), sy + static_cast<int32_t>(h), 1 };
+    bl.dstOffsets[0]  = { dx, dy, 0 };
+    bl.dstOffsets[1]  = { dx + static_cast<int32_t>(w), dy + static_cast<int32_t>(h), 1 };
+    vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_NEAREST);
+}
+
+// Fill one of our GENERAL images with a constant (portrait atlas depth: a flat plane).
+static void FeedVkClear(FeedVk *vk, VkCommandBuffer cb, VkImage img, float value)
+{
+    VkClearColorValue v = {};
+    v.float32[0] = v.float32[1] = v.float32[2] = v.float32[3] = value;
+    const VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vk->CmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
 }
 
 // DXGI_FORMAT -> VkFormat for the shared-resource formats this project uses.

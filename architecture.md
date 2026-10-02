@@ -141,3 +141,67 @@ layer\dxgi.dll                    (DXGI bootstrap)
 - **Experimental status**: This is prototype software with known limitations
 - **Profile compatibility**: Do not combine the active package with OptiScaler, Smooth Motion, or a second DLSS/Streamline injector
 - **Streamline identity**: The donor Streamline runtime does not have a valid NVIDIA application identity for CK3, so direct NGX features may remain disabled until supported project identity and resource tagging are added
+
+## Native Streamline Bridge Details
+
+For the opt-in Native Streamline profile, the bridge calls `slInit` for Vulkan with the DLSS and DLSS-RR plugins when CK3 dynamically loads `vulkan-1.dll`. It returns the normal system Vulkan loader handle, tracks surviving instances across CK3's temporary probes, and routes proc-address lookups through typed wrappers. Surface operations (Win32 surface creation, destruction, presentation support, capability queries) use the system Vulkan loader to avoid the donor interposer's unbound surface thunk during CK3's device-first startup; device and swapchain operations remain routed through Streamline. If initialization fails, CK3 uses the normal Vulkan loader without interception. The result is recorded in `binaries\dlss5-dxgi.log`.
+
+The feeder's existing NGX path remains the evaluator fallback; direct Streamline resource tagging and feature evaluation are not yet implemented.
+
+## RHI Coexistence
+
+RHI may remain installed. The launcher sets `DISABLE_VK_LAYER_reshade_1=1` only for the CK3 process to suppress a separately registered global ReShade Vulkan layer, while the package manifest uses its own disable key and remains active. RHI or another injector must not replace this package's `binaries\dxgi.dll`: it contains the custom `DLSS5Bootstrap` entry point that the Vulkan layer requires.
+
+## Portrait Mode (Frontier 1, unreleased)
+
+`portrait_mode=1` restricts DLSS and DLSS 5 Neural Rendering to the CK3 GUI portraits. `src/feed_render_dump.h` tags the GUI portrait pipeline from SPIR-V member names and reads each portrait's on-screen rectangle from its constant buffer. The Vulkan transport packs the visible rectangles into a pixel-budgeted atlas, evaluates only the atlas, and `src/feed_portrait_blend.h` feathers the result back into the frame. See [frontier.md](frontier.md) for the full design log and measurements.
+
+## Package Layout
+
+```text
+Crusader Kings III\
+  Open CK3 DLSS Installer.cmd
+  Install CK3 DLSS.cmd
+  Install CK3 DLSS 4.5 RTX 3060 Test.cmd
+  Install CK3 DLSS 5 Stock Test.cmd
+  Install CK3 DLSS 5 Extended Test.cmd
+  Install CK3 DLSS Native Streamline Experimental.cmd
+  Configure CK3 DLSS Runtime.cmd
+  Launch CK3 with DLSS.cmd
+  Disable CK3 DLSS.cmd
+  DLSS5-CK3.ps1
+  DLSS-Runtime-Setup.ps1
+  Graphics-Dependency-Setup.ps1
+  tools\
+    CK3-DLSS-Installer\
+      CK3 DLSS Installer.exe
+    RHI-Setup.exe
+  binaries\
+    ck3.exe                              (provided by CK3)
+    dxgi.dll                             (this package's DXGI/D3D12 bootstrap)
+    ReShade.ini
+    DLSS5-CK3.ini
+    dlss5-vulkan\
+      ReShade64.dll
+      ReShade64.json
+      VkLayer_feed_vk.dll
+      VkLayer_feed_vk.json
+    dlss-payload\
+      dlss5-feed.addon64
+      runtimes\DLSS45\...
+      runtimes\DLSS5\...
+      runtimes\DLSS5Extended\...
+      runtimes\NativeStreamline\...
+    dlss-active\                         (created by the installer)
+    reshade-shaders\Shaders\
+      DLSS5_Feed.fx
+    third-party\vort_Shaders\
+```
+
+## Packaging
+
+CK3 packaging scripts and the drag-and-drop template are under `ck3-package`. Build and stage the self-contained installer app (JDK 17) before creating a release package:
+
+```powershell
+.\Build-Installer-GUI.ps1
+```
