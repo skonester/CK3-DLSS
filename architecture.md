@@ -156,6 +156,10 @@ RHI may remain installed. The launcher sets `DISABLE_VK_LAYER_reshade_1=1` only 
 
 `portrait_mode=1` restricts DLSS and DLSS 5 Neural Rendering to the CK3 GUI portraits. `src/feed_render_dump.h` tags the GUI portrait pipeline from SPIR-V member names and reads each portrait's on-screen rectangle from its constant buffer. The Vulkan transport packs the visible rectangles into a pixel-budgeted atlas, evaluates only the atlas, and `src/feed_portrait_blend.h` feathers the result back into the frame. See [frontier.md](frontier.md) for the full design log and measurements.
 
+The [Frontier 2 blend optimization](frontier2.md) schedules only disjoint feather bands in one compute dispatch. Where the output format supports typed UAV loads, it blends in place without a scratch atlas or full-atlas copy; other formats retain an SRV copy fallback. Portrait interiors and unused atlas padding are untouched. The existing frame-slot fences protect the mapped blend constants, and UAV barriers order the pass after NGX evaluation. The alpha-aware portrait mask remains outstanding.
+
+`src/feed_portrait_atlas.h` provides persistent guarded slots using MaxRects splitting. The budget covers the full allocated texture, including holes and alignment. Initial compact dimensions follow crop demand; expansion buys coverage, aspect changes require a missing large portrait, and a 180-update delay controls shrinkage. Surviving crops reserve their old addresses. Removals retain history when remaining crops and addresses match; new or changed crops still reset the feature globally. Color and optional mask inputs are cleared before crop copies, with a transfer write barrier, so retired slots and guards are deterministic. Crops that cannot fit retain native rendering. This affects portrait mode on Vulkan; other transport paths keep their existing full-frame behavior.
+
 ## Package Layout
 
 ```text

@@ -260,6 +260,28 @@ static void FeedVkClear(FeedVk *vk, VkCommandBuffer cb, VkImage img, float value
     vk->CmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
 }
 
+// Portrait inputs: deterministic padding and retired slots. A transfer write
+// dependency makes the subsequent crop copies win over these whole-image clears.
+static void FeedVkClearAtlas(FeedVk *vk, VkCommandBuffer cb, VkImage color, VkImage mask)
+{
+    const VkImage images[2] = { color, mask };
+    const uint32_t count = mask != VK_NULL_HANDLE ? 2u : 1u;
+    VkImageMemoryBarrier cleared[2] = {};
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        FeedVkClear(vk, cb, images[i], 0.0f);
+        VkImageMemoryBarrier &b = cleared[i];
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcAccessMask = b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = images[i];
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    }
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, count, cleared);
+}
+
 // DXGI_FORMAT -> VkFormat for the shared-resource formats this project uses.
 static VkFormat FeedVkFormat(DXGI_FORMAT f)
 {

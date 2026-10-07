@@ -15,13 +15,17 @@ Rendering on character faces. Drop it into your CK3 folder, pick a profile, and 
 affects CK3, and you can switch it off at any time.
 
 > [!IMPORTANT]
-> **Current work: [Frontier 1](frontier.md), not in a release yet.**
+> **Current work: [Frontier 2](frontier2.md), not in a release yet.**
 > DLSS 5 Neural Rendering used to run at about **15 fps on an RTX 3060** because it processed the
 > whole screen. Frontier 1 applies it **only to the character portraits**, which brings that to
 > **about 40 fps**, and CK3 now starts in seconds instead of minutes.
 > There is still a slight square box around portraits, most visible while zooming the map.
-> **That is planned to be fixed in Frontier 2, and a new release will follow then.** Until then,
-> the download below is the previous release. [Read the full Frontier 1 log](frontier.md).
+> **The remaining mask fix and live validation are planned in [Frontier 3](frontier3.md).**
+> The download below is the previous release. [Read the full Frontier 1 log](frontier.md).
+> Frontier 2 now optimizes the portrait blend with edge-only compute and in-place GPU reads.
+> Persistent atlas slots now enforce the budget on the full texture and reduce rebuilds
+> in recorded-scene replay. The alpha-mask fix and new in-game measurements remain pending.
+> [Measured results and remaining work](frontier2.md).
 
 ## What you need
 
@@ -105,7 +109,9 @@ If you report a problem, please include these log files from the `binaries` fold
 
 ## For developers
 
-- [frontier.md](frontier.md): current work (portrait-only DLSS 5) with measurements.
+- [frontier.md](frontier.md): portrait-only DLSS 5 design and Frontier 1 measurements.
+- [frontier2.md](frontier2.md): portrait blend and atlas optimization, GPU benchmarks, recorded-scene replay, and regression checks.
+- [frontier3.md](frontier3.md): next-agent handoff for portrait coverage, live measurements, metadata/history, and depth investigation.
 - [architecture.md](architecture.md): how the DXGI bridge, Vulkan layer, feeder and profiles fit
   together, plus the package layout.
 - [UPSTREAM-COMPAT-TESTING.md](UPSTREAM-COMPAT-TESTING.md): upstream fixes ported and how they

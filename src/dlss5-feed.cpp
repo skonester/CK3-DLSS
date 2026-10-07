@@ -49,7 +49,7 @@
 #include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "ck3-upstream-test.3"
+#define FEED_VERSION "ck3-frontier2-atlas.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2220,123 +2220,21 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
 #include "feed_portrait_blend.h"  // portrait mode: feathered paste-back on the D3D12 side
 
 // ---------------------------------------------------------------------------
-// Portrait atlas (portrait_mode=1): the visible GUI portraits, grown by the feather margin, snapped
-// to a 32-px grid, clipped to the screen, overlaps merged, shelf-packed at deterministic positions.
-// DLSS + the DLSS 5 add-on's NR run on the atlas only -- the cost follows the portrait pixels, and
-// drops to zero with none shown. The blend fades NR in over the margin, so no hard square shows.
+// Frontier 2 portrait atlas: guarded persistent slots, charged by allocated pixels.
+// Compact and full tiers absorb window changes; surviving crops keep their addresses.
 // ---------------------------------------------------------------------------
 
-struct AtlasItem { int sx, sy, dx, dy, w, h, edges; };   // edges: 1 left, 2 top, 4 right, 8 bottom on the screen border
-struct PortraitAtlas { UINT w = 0, h = 0; std::vector<AtlasItem> items; };
+#include "feed_portrait_atlas.h"
+using AtlasItem = portrait::Item;
+using PortraitAtlas = portrait::Atlas;
+static_assert(portrait::kMaxItems == pblend::kMaxBlocks, "atlas/blend block limit mismatch");
 static PortraitAtlas g_atlas;
 
-// min_w/min_h: keep at least this atlas size -- a different size rebuilds the feature.
-// prev: the current atlas, whose blocks are reused while a portrait still fits inside one.
-static bool BuildPortraitAtlas(const std::vector<dump::PRect> &in, UINT sw, UINT sh, UINT min_w, UINT min_h,
-                               const PortraitAtlas *prev, PortraitAtlas &out)
+static bool BuildPortraitAtlas(const std::vector<dump::PRect> &in, UINT sw, UINT sh,
+                               const PortraitAtlas *previous, PortraitAtlas &out)
 {
-    const int grow = g_cfg.portrait_feather, snap = 16;
-    auto down = [](int v) { return (v >= 0 ? v / snap : -((-v + snap - 1) / snap)) * snap; };
-    auto up   = [&](int v) { return down(v + snap - 1); };
-    auto area = [](const dump::PRect &q) { return static_cast<long long>(q.w) * q.h; };
-    auto overlap = [](const dump::PRect &a, const dump::PRect &b) {
-        return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
-    };
-    auto unite = [](const dump::PRect &a, const dump::PRect &b) {
-        const int x0 = (std::min)(a.x, b.x), y0 = (std::min)(a.y, b.y);
-        const int x1 = (std::max)(a.x + a.w, b.x + b.w), y1 = (std::max)(a.y + a.h, b.y + b.h);
-        return dump::PRect{ x0, y0, x1 - x0, y1 - y0 };
-    };
-
-    struct Blk { dump::PRect wid, blk; };   // the portrait widget (visible part) and its processed block
-    std::vector<Blk> r;
-    for (const dump::PRect &p : in)
-    {
-        const int vx0 = (std::max)(p.x, 0), vy0 = (std::max)(p.y, 0);
-        const int vx1 = (std::min)(p.x + p.w, static_cast<int>(sw)), vy1 = (std::min)(p.y + p.h, static_cast<int>(sh));
-        if (vx1 - vx0 < g_cfg.portrait_min || vy1 - vy0 < g_cfg.portrait_min) continue;
-        const dump::PRect wid = { vx0, vy0, vx1 - vx0, vy1 - vy0 };
-        const int x0 = (std::max)(down(vx0 - grow), 0), y0 = (std::max)(down(vy0 - grow), 0);
-        const int x1 = (std::min)(up(vx1 + grow), static_cast<int>(sw)), y1 = (std::min)(up(vy1 + grow), static_cast<int>(sh));
-        dump::PRect blk = { x0, y0, x1 - x0, y1 - y0 };
-        // Sticky: while the widget still fits inside one of the current blocks (the hover pop-out
-        // shrinking back, sub-pixel drift) keep that block, so the layout and NR's history hold --
-        // unless that block is much bigger than this portrait needs.
-        if (prev != nullptr)
-            for (const AtlasItem &it : prev->items)
-                if (wid.x >= it.sx && wid.y >= it.sy && wid.x + wid.w <= it.sx + it.w && wid.y + wid.h <= it.sy + it.h &&
-                    static_cast<long long>(it.w) * it.h * 2 <= area(blk) * 3)
-                {
-                    blk = { it.sx, it.sy, it.w, it.h };
-                    break;
-                }
-        r.push_back({ wid, blk });
-    }
-    // Merge only where the portraits themselves overlap (or share a block); touching margins stay
-    // separate blocks, so neighbouring heads do not turn into one large rectangle of empty UI.
-    for (bool merged = true; merged;)
-    {
-        merged = false;
-        for (size_t i = 0; i < r.size() && !merged; ++i)
-            for (size_t j = i + 1; j < r.size() && !merged; ++j)
-                if (overlap(r[i].wid, r[j].wid) || memcmp(&r[i].blk, &r[j].blk, sizeof(dump::PRect)) == 0)
-                {
-                    r[i] = { unite(r[i].wid, r[j].wid), unite(r[i].blk, r[j].blk) };
-                    r.erase(r.begin() + j);
-                    merged = true;
-                }
-    }
-
-    // Pixel budget: NR costs ~linearly in atlas pixels, so the biggest portraits win and the rest
-    // are passed through untouched rather than dragging the frame rate down.
-    std::sort(r.begin(), r.end(), [&](const Blk &a, const Blk &b) { return area(a.blk) > area(b.blk); });
-    const long long budget = static_cast<long long>(g_cfg.portrait_budget) * 1000;
-    std::vector<dump::PRect> keep;
-    long long used = 0;
-    for (const Blk &b : r)
-    {
-        if (keep.size() == static_cast<size_t>(pblend::kMaxBlocks)) break;
-        if (used + area(b.blk) > budget) continue;
-        used += area(b.blk);
-        keep.push_back(b.blk);
-    }
-    if (keep.empty()) return false;
-    std::sort(keep.begin(), keep.end(), [](const dump::PRect &a, const dump::PRect &b) {
-        if (a.h != b.h) return a.h > b.h;
-        if (a.y != b.y) return a.y < b.y;
-        return a.x < b.x;
-    });
-
-    // Padding keeps NR's spatial filter from reading one block into the next.
-    const int pad = 8;
-    long long packed = 0;
-    int widest = 0;
-    for (const dump::PRect &q : keep) { packed += static_cast<long long>(q.w + pad) * (q.h + pad); widest = (std::max)(widest, q.w); }
-    int aw = (std::max)(widest + 2 * pad, static_cast<int>(sqrt(static_cast<double>(packed))) + pad);
-    aw = (std::max)(((aw + 63) / 64) * 64, static_cast<int>(min_w));
-
-    out.items.clear();
-    int x = pad, y = pad, shelf = 0;
-    for (const dump::PRect &q : keep)
-    {
-        if (x + q.w + pad > aw) { x = pad; y += shelf + pad; shelf = 0; }
-        const int edges = (q.x == 0 ? 1 : 0) | (q.y == 0 ? 2 : 0) |
-                          (q.x + q.w == static_cast<int>(sw) ? 4 : 0) | (q.y + q.h == static_cast<int>(sh) ? 8 : 0);
-        out.items.push_back({ q.x, q.y, x, y, q.w, q.h, edges });
-        x += q.w + pad;
-        shelf = (std::max)(shelf, q.h);
-    }
-    out.w = static_cast<UINT>(aw);
-    out.h = (std::max)(static_cast<UINT>((((y + shelf + pad) + 63) / 64) * 64), min_h);
-    return true;
-}
-
-static bool SameAtlasLayout(const PortraitAtlas &a, const PortraitAtlas &b)
-{
-    if (a.w != b.w || a.h != b.h || a.items.size() != b.items.size()) return false;
-    for (size_t i = 0; i < a.items.size(); ++i)
-        if (memcmp(&a.items[i], &b.items[i], sizeof(AtlasItem)) != 0) return false;
-    return true;
+    return portrait::Build(in, sw, sh,
+        { g_cfg.portrait_min, g_cfg.portrait_feather, uint64_t(g_cfg.portrait_budget) * 1000 }, previous, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -2414,8 +2312,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         return;
     }
 
-    // Portrait mode: the shared textures and the feature are atlas-sized; with no portraits on screen
-    // (or while they are still moving) nothing is evaluated at all.
+    // Portrait mode: the shared textures and the feature are atlas-sized; no visible
+    // eligible portraits means no neural evaluation and an untouched game frame.
     const bool portraits = g_cfg.portrait_mode != 0 && g_cfg.mode == 2;
     UINT fw = w, fh = h;
     if (portraits)
@@ -2423,7 +2321,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         std::vector<dump::PRect> rects;
         dump::GetPortraits(rects);
         PortraitAtlas next;
-        if (!BuildPortraitAtlas(rects, w, h, g_atlas.w, g_atlas.h, &g_atlas, next))
+        if (!BuildPortraitAtlas(rects, w, h, &g_atlas, next))
         {
             g.need_reset = true;   // history is stale by the time portraits come back
             static UINT64 skipped = 0;
@@ -2433,21 +2331,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     static_cast<unsigned long long>(skipped));
             return;
         }
-        // Shrink after ~1.5 s of fitting a smaller atlas: brief window flicker does not rebuild the
-        // feature, but an oversized atlas does not keep costing NR time either.
-        static int shrink_frames = 0;
-        PortraitAtlas tight;
-        if (next.w == g_atlas.w && next.h == g_atlas.h && BuildPortraitAtlas(rects, w, h, 0, 0, &g_atlas, tight) &&
-            (tight.w < next.w || tight.h < next.h))
+        const bool reset_atlas = !portrait::SameHistory(g_atlas, next);
+        if (reset_atlas) g.need_reset = true;
+        if (!portrait::SameLayout(g_atlas, next))
         {
-            if (++shrink_frames > 90) { next = tight; shrink_frames = 0; }
-        }
-        else
-            shrink_frames = 0;
-
-        if (!SameAtlasLayout(next, g_atlas))
-        {
-            g.need_reset = true;   // positions moved inside the atlas: start NR history over
             char line[1024];
             int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "[feed] portrait atlas %ux%u, %u block(s):",
                                   next.w, next.h, static_cast<unsigned>(next.items.size()));
@@ -2455,10 +2342,16 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (len > 0 && len < static_cast<int>(sizeof(line)) - 48)
                     len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %d,%d %dx%d", it.sx, it.sy, it.w, it.h);
             Log("%s", line);
+            uint32_t retained = 0;
+            for (const AtlasItem &it : next.items)
+                if (std::any_of(g_atlas.items.begin(), g_atlas.items.end(),
+                    [&](const AtlasItem &old) { return portrait::SameItem(it, old); })) ++retained;
+            Log("[feed] atlas allocation: %llu/%llu pixels, %u retained slot(s), history %s",
+                uint64_t(next.w) * next.h, next.budget, retained, reset_atlas ? "reset" : "retained");
         }
-        g_atlas = next;
-        fw = next.w;
-        fh = next.h;
+        g_atlas = std::move(next);
+        fw = g_atlas.w;
+        fh = g_atlas.h;
     }
 
     bool ok = true;
@@ -2529,6 +2422,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     FeedVkCopyRegion(&g.vk, cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[slot], VK_IMAGE_LAYOUT_GENERAL,
                                      it.sx, it.sy, it.dx, it.dy, static_cast<UINT>(it.w), static_cast<UINT>(it.h));
         };
+        if (portraits)
+            FeedVkClearAtlas(&g.vk, cb, g.vk_img[SLOT_COLOR], g.mask_ok ? g.vk_img[SLOT_MASK] : VK_NULL_HANDLE);
         copy_in(bb_img, SLOT_COLOR);
         // GUI portraits do not move on screen; VORT's vectors there describe the map behind them, and
         // following those (zooming, panning) drags the portrait's history around inside its block.
