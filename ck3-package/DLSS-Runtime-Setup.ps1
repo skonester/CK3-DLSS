@@ -485,7 +485,12 @@ function New-DefaultFeederConfig([string]$SelectedMode) {
     $warmup = if ($SelectedMode -eq 'DLSS45') { 0 } else { 180 }
     # Model M explicitly enables the requested DLSS 4.5 test. It works with DLAA on RTX 3060,
     # although RTX 20/30 cards lack native FP8 and can pay a larger performance cost than K.
-    $preset = if ($SelectedMode -eq 'DLSS45') { 13 } else { 0 }
+    $preset = 13
+    # DLSS 5 profiles run neural rendering on the character portraits only (Frontier 1/2):
+    # the whole frame drops CK3 to ~17 fps on an RTX 3060. DLSS 4.5 stays full-frame DLAA.
+    $portrait = if ($SelectedMode -eq 'DLSS45') { '' } else {
+        "render_dump=0`r`nportrait_mode=1`r`nportrait_min=48`r`nportrait_feather=16`r`nportrait_budget=400`r`n"
+    }
     return @"
 # CK3 portable profile: $SelectedMode
 # mode=2 is the full NVIDIA NGX DLSS/DLAA path. mode=1 is only a transport diagnostic.
@@ -503,6 +508,7 @@ create_delay=$delay
 preset=$preset
 mv_scale_x=1.000
 mv_scale_y=1.000
+$portrait
 "@
 }
 

@@ -77,6 +77,24 @@ jobs:
           name: CK3-DLSS-Installer
           path: artifact
 
+      - name: Check the package
+        shell: pwsh
+        run: |
+          # Files the installer refuses to run without (DLSS5-CK3.ps1 Test-BootstrapPackage).
+          $required = 'DLSS5-CK3.ps1', 'Graphics-Dependency-Setup.ps1', 'DLSS-Runtime-Setup.ps1',
+            'binaries/dxgi.dll', 'binaries/dlss-payload/dlss5-feed.addon64', 'binaries/ReShade.ini', 'binaries/DLSS5-CK3.ini',
+            'binaries/reshade-shaders/Shaders/DLSS5_Feed.fx', 'binaries/dlss5-vulkan/ReShade64.json',
+            'binaries/dlss5-vulkan/VkLayer_feed_vk.dll', 'binaries/dlss5-vulkan/VkLayer_feed_vk.json'
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path ck3-package $_)) }
+          if ($missing) { throw "package is missing: $($missing -join ', ')" }
+          # A fresh DLSS 5 install must start in portrait mode; full-frame DLSS 5 runs CK3 at ~17 fps.
+          $src = Get-Content ck3-package/DLSS-Runtime-Setup.ps1 -Raw
+          Invoke-Expression ([regex]::Match($src, '(?s)function New-DefaultFeederConfig.*?\r?\n\}\r?\n').Value)
+          foreach ($mode in 'DLSS5', 'DLSS5Extended', 'NativeStreamline') {
+            if ((New-DefaultFeederConfig $mode) -notmatch '(?m)^portrait_mode=1') { throw "$mode default config does not enable portrait mode" }
+          }
+          'package checks passed'
+
       - name: Assemble CK3-DLSS.zip
         shell: pwsh
         run: |
