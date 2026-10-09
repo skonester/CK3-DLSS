@@ -127,6 +127,49 @@ static inline bool SameHistory(const Atlas &previous, const Atlas &next)
     return true;
 }
 
+// Frontier 3: why SameHistory failed, as bits (one layout change can have several causes).
+// Zero exactly when SameHistory is true. Geometry only: a same-place replacement of one
+// character by another is invisible here and needs source identity (frontier3.md section 3).
+enum : uint32_t
+{
+    kHistoryCanvas     = 1,    // atlas dimensions changed
+    kHistoryNewCrop    = 2,    // a crop with no geometric relation to any previous slot
+    kHistoryMovedSlot  = 4,    // same screen crop, new atlas address
+    kHistoryTranslated = 8,    // same atlas slot and size, new screen position
+    kHistoryResized    = 16,   // crop overlaps a previous crop but its rectangle changed
+};
+static inline uint32_t HistoryChange(const Atlas &previous, const Atlas &next)
+{
+    uint32_t why = (previous.w != next.w || previous.h != next.h) ? kHistoryCanvas : 0u;
+    for (const Item &item : next.items)
+    {
+        if (std::any_of(previous.items.begin(), previous.items.end(), [&](const Item &old) { return SameItem(item, old); })) continue;
+        uint32_t cause = kHistoryNewCrop;
+        for (const Item &old : previous.items)
+        {
+            if (old.sx == item.sx && old.sy == item.sy && old.w == item.w && old.h == item.h) { cause = kHistoryMovedSlot; break; }
+            if (old.dx == item.dx && old.dy == item.dy && old.w == item.w && old.h == item.h) cause = kHistoryTranslated;
+            else if (cause == kHistoryNewCrop && Overlap({ old.sx, old.sy, old.w, old.h }, { item.sx, item.sy, item.w, item.h }))
+                cause = kHistoryResized;
+        }
+        why |= cause;
+    }
+    return why;
+}
+
+static inline const char *HistoryChangeName(uint32_t bit)
+{
+    switch (bit)
+    {
+    case kHistoryCanvas:     return "canvas";
+    case kHistoryNewCrop:    return "new_crop";
+    case kHistoryMovedSlot:  return "moved_slot";
+    case kHistoryTranslated: return "translated";
+    case kHistoryResized:    return "resized";
+    default:                 return "?";
+    }
+}
+
 static inline Plan Pack(Canvas canvas, const std::vector<Candidate> &candidates,
                         uint32_t sw, uint32_t sh, uint64_t pixels, const Atlas *previous)
 {

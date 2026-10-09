@@ -49,7 +49,7 @@
 #include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "ck3-frontier2-atlas.1"
+#define FEED_VERSION "ck3-frontier3-diag.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -261,9 +261,10 @@ struct Cfg
     int   portrait_min;     // portraits whose visible width or height is below this many pixels are skipped
     int   portrait_feather; // px: each portrait block grows by this much and NR fades in over it (0 = hard edge)
     int   portrait_budget;  // max atlas pixels in thousands (NR cost is ~linear in pixels; 400 ~ 11 ms on an RTX 3060)
+    int   frame_stats;      // 1 = time every game present into dlss5-feed-frames.csv (Frontier 3 baseline; live)
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f, 1, 0, 0, 48, 16, 400 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f, 1, 0, 0, 48, 16, 400, 0 };
 
 static void CfgPath(char *out)
 {
@@ -292,11 +293,12 @@ static void CfgWriteDefault()
             "create_delay=%d\n"
             "preset=%d\n"
             "mv_scale_x=%.3f\n"
-            "mv_scale_y=%.3f\nvk_present_sync=%d\nrender_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\n",
+            "mv_scale_y=%.3f\nvk_present_sync=%d\nrender_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\n"
+            "frame_stats=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync, g_cfg.render_dump, g_cfg.portrait_mode,
-            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget);
+            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -336,6 +338,7 @@ static bool CfgReload()
         else if (_stricmp(key, "portrait_min")   == 0) next.portrait_min   = iv < 16 ? 16 : iv;
         else if (_stricmp(key, "portrait_feather") == 0) next.portrait_feather = iv < 0 ? 0 : iv > 64 ? 64 : iv;
         else if (_stricmp(key, "portrait_budget") == 0) next.portrait_budget = iv < 50 ? 50 : iv;
+        else if (_stricmp(key, "frame_stats")    == 0) next.frame_stats    = iv != 0;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -365,11 +368,11 @@ static void CfgSave()
     fprintf(f,
             "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nvk_present_sync=%d\n"
-            "render_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\n",
+            "render_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\nframe_stats=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync, g_cfg.render_dump, g_cfg.portrait_mode,
-            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget);
+            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats);
     fclose(f);
 }
 
@@ -485,6 +488,7 @@ struct Feed
     bool session_ready;
     bool frame_ready;
     bool need_reset;
+    uint32_t reset_why;    // Frontier 3: why need_reset was raised (fstats::kReset* | portrait::kHistory*)
     bool warmup_done;
     int  consecutive_fails;
     int  cfg_rebuild_seen;
@@ -762,6 +766,7 @@ static UINT64 EndCommands()
         AbortCommands();
         g.frame_ready = false;
         g.need_reset = true;
+        g.reset_why |= 1u << 11;   // fstats::kResetFailure (declared later)
         FeedFail("command list close");
         return 0;
     }
@@ -1181,7 +1186,7 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (!MakeBlitShaders()) { ReleaseFrameResources(); return false; }
 
-    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; g.reset_why |= 1u << 8; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
@@ -1266,6 +1271,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) ? "AutoExposure" : "",
         FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "");
     g.need_reset  = true;
+    g.reset_why  |= 1u << 8;   // fstats::kResetBuild (declared later)
     g.frame_ready = true;
     return true;
 }
@@ -1586,7 +1592,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return false;
     }
 
-    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; g.reset_why |= 1u << 8; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
@@ -1854,7 +1860,7 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return false;
     }
 
-    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; g.reset_why |= 1u << 8; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
@@ -2120,6 +2126,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
             {
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
                 g.need_reset = false;
+                g.reset_why = 0;
 
                 // ReShade parked the effect textures as shader_resource (both SR states on D3D12).
                 MvProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2225,6 +2232,8 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
 // ---------------------------------------------------------------------------
 
 #include "feed_portrait_atlas.h"
+#include "feed_frame_stats.h"     // Frontier 3: per-present timing (frame_stats=1)
+static_assert(fstats::kResetBuild == 1u << 8 && fstats::kResetFailure == 1u << 11, "reset_why bits set before feed_frame_stats.h");
 using AtlasItem = portrait::Item;
 using PortraitAtlas = portrait::Atlas;
 static_assert(portrait::kMaxItems == pblend::kMaxBlocks, "atlas/blend block limit mismatch");
@@ -2249,6 +2258,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
+    fstats::Scope stats_scope;   // Frontier 3: per-present note for frame_stats=1
 
     // Counted per call, not per delivered frame: portrait mode skips frames with no portraits.
     static UINT64 calls = 0;
@@ -2320,9 +2330,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     {
         std::vector<dump::PRect> rects;
         dump::GetPortraits(rects);
+        fstats::g_note.portraits = static_cast<uint32_t>(rects.size());
+        fstats::g_note.rect_age = dump::PortraitAge();
         PortraitAtlas next;
         if (!BuildPortraitAtlas(rects, w, h, &g_atlas, next))
         {
+            fstats::g_note.skip = rects.empty() ? fstats::SKIP_NO_PORTRAITS : fstats::SKIP_TOO_SMALL;
+            g.reset_why |= fstats::kResetResume;
             g.need_reset = true;   // history is stale by the time portraits come back
             static UINT64 skipped = 0;
             if ((++skipped % 1800) == 1)
@@ -2332,7 +2346,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             return;
         }
         const bool reset_atlas = !portrait::SameHistory(g_atlas, next);
-        if (reset_atlas) g.need_reset = true;
+        if (reset_atlas) { g.need_reset = true; g.reset_why |= portrait::HistoryChange(g_atlas, next); }
         if (!portrait::SameLayout(g_atlas, next))
         {
             char line[1024];
@@ -2352,6 +2366,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         g_atlas = std::move(next);
         fw = g_atlas.w;
         fh = g_atlas.h;
+        fstats::g_note.atlas_w = fw;
+        fstats::g_note.atlas_h = fh;
+        fstats::g_note.blocks = static_cast<uint32_t>(g_atlas.items.size());
     }
 
     bool ok = true;
@@ -2375,6 +2392,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     {
         Log("[feed] building: %ux%u %s %s (Vulkan transport, depth reversed=%d)", fw, fh,
             portraits ? "portrait atlas, backbuffer" : "backbuffer", FormatName(bbf), g.depth_reversed ? 1 : 0);
+        fstats::g_note.build = true;
         ok = BuildResourcesVk(fw, fh, bbf);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
@@ -2481,6 +2499,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(1, res, from, to);
             }
             ++g.frames_done;
+            fstats::g_note.skip = fstats::SKIP_NONE;   // transport test: not an evaluation, not a skip
         }
         else
         {
@@ -2494,7 +2513,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
             const UINT64 n = ++g.vk_frame;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            fstats::g_note.reset = reset;
+            fstats::g_note.reset_why = g.reset_why | (g_cfg.reset_every ? fstats::kResetEvery : 0u);
             g.need_reset = false;
+            g.reset_why = 0;
 
             Breadcrumb("signalling the game-side fence (Vulkan)");
             g.rs_queue->flush_immediate_command_list();
@@ -2613,6 +2635,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(1, res, from, to);
             }
 
+            fstats::g_note.skip = done ? fstats::SKIP_NONE : fstats::SKIP_FAILED;
+            fstats::g_note.evaluated = done;
             if (done)
             {
                 const UINT64 fn = ++g.frames_done;
@@ -2781,6 +2805,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
                 g.need_reset = false;
+                g.reset_why = 0;
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
@@ -3204,11 +3229,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_overlay(nullptr, DrawOverlay);
         if (g_cfg.render_dump || g_cfg.portrait_mode) { dump::Register(g_cfg.render_dump != 0); g_dump_registered = true; }
+        fstats::Register();   // inert until frame_stats=1 (live)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
         if (g_dump_registered) { dump::Unregister(); g_dump_registered = false; }
+        fstats::Unregister();
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);

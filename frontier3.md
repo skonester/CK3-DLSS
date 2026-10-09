@@ -5,6 +5,104 @@ tree and the installed Frontier 2 build. Frontier is the CK3 rendering milestone
 name in this repository. Read [Frontier 2](frontier2.md) for the completed work and
 [Frontier 1](frontier.md) for the original portrait investigation.
 
+## Progress on 2026-10-09: offline work done, live steps waiting
+
+Everything below that can be built and verified without playing CK3 is done. Sections 0
+and 1 need a live session, and the install is not on the profile Frontier 3 needs. No new
+build has been deployed to the game folder.
+
+### The install changed after this handoff
+
+On 2026-10-08 the install was switched to the experimental **NativeStreamline** profile.
+The feeder is still `ck3-frontier2-atlas.1` (SHA-256 `c34f6abf…`), but the active config
+has no portrait settings (`preset=0`, no `portrait_mode`), so the feeder evaluates the full
+frame. In that session ReShade.log shows `feature 18 create failed with 0xbad00001` and no
+"evaluation succeeded" line: DLSS 5 neural rendering did not run. Frontier 3 measures
+portrait mode on **DLSS5Extended**. Switching back is the user's decision. Reinstalling
+DLSS5Extended restores the saved profile config from `binaries/dlss-cache/profiles/
+DLSS5Extended/dlss5-feed.cfg` (preset 13, portrait_mode 1, feather 16, budget 400) and puts
+the Frontier 2 payload feeder back into `dlss-active`.
+
+### What was built (build `ck3-frontier3-diag.1`, file version still 0.6.0.0)
+
+All new behaviour is off by default. With the default config the only differences from
+Frontier 2 are the build name, reset-cause bookkeeping and an inert present callback.
+
+| Area | Change | Files |
+|---|---|---|
+| Section 0/2: render dump | With `render_dump=1`: the set/binding of the Frame, Mask, Portrait and Background textures is parsed from both shader stages; image descriptors and texture/view lifetimes are tracked; every portrait draw logs its textures as `T#id` (each texture described once: size, format, mips, usage, view) plus PortraitUVOffset/Scale, PopOutThreshold and IsGrayscale. Ctrl+Shift+F11 now also probes that frame's Portrait/Mask/Frame textures: alpha statistics over the exact texel rectangle each draw samples, an "alpha looks like character coverage" verdict, and PNGs in `binaries/dlss-active/dlss5-feed-dump/`. To make the copy legal, dump mode adds copy_source to sampled 2D textures at creation. | `src/feed_render_dump.h`, `src/feed_dump_probe.h` |
+| Section 1: baseline | `frame_stats=1` (live, no restart) writes one CSV row per game Vulkan present to `dlss5-feed-frames.csv`, evaluated or not: interval, evaluated/skip reason, atlas size, blocks, portrait count, rectangle age, reset and reset causes, feature builds, feeder CPU time. Every 600 presents the log gets median/p95/p99/max, hitch counts and skip/reset breakdowns. `tools/frame-stats.ps1` summarises a capture with warm-up and post-build exclusion, a time window, and `-Compare` for matched runs. | `src/feed_frame_stats.h`, `tools/frame-stats.ps1` |
+| Section 3: resets | Every reset carries its causes: canvas, new_crop, moved_slot, translated, resized (atlas geometry), plus build, resume, reset_every and failure. GetPortraits' data now has a frame of origin (`rect_age` in the CSV). Behaviour is unchanged: resets stay conservative. | `src/feed_portrait_atlas.h`, `src/dlss5-feed.cpp` |
+| Section 2: composite | The blend pass accepts an R8 coverage atlas. A block flagged in `Cb::coverage_blocks` is one job over the whole block, interior included: `src + (neural - src) * feather * coverage`, with coverage 0 giving the original pixel bit-exactly and 1 the neural pixel. Flags are ignored when no coverage is bound, so a missing mask falls back to the legacy edge feather. The feeder does not bind coverage yet: no verified mask producer exists. | `src/feed_portrait_blend.h` |
+| Deployment | `tools/Frontier3-Live.ps1`: Status, Deploy (refuses unless DLSS5Extended and CK3 closed; hash-verified backup, both copies, receipt), Configure (render_dump, frame_stats, portrait_*), Collect (logs, CSV, dump PNGs into `build/frontier3-<label>-<stamp>/`), Restore. | `tools/Frontier3-Live.ps1` |
+
+### Evidence, with its limits
+
+Reset causes on the recorded geometry replays (crop geometry only; one reset can have
+several causes):
+
+| Replay | Resets | canvas | new_crop | moved_slot | translated | resized |
+|---|---|---|---|---|---|---|
+| `frontier2-session-crops.tsv`, 405 layouts | 274 | 11 | 105 | 64 | 62 | 193 |
+| `frontier2-trace-crops.tsv`, 109 layouts | 75 | 1 | 23 | 6 | 28 | 36 |
+
+"resized" dominates: crops that overlap a previous crop but changed rectangle. These are
+geometry labels, not identity: a same-place character swap is invisible to them.
+
+Blend microbenchmark, RTX 3060, 640x640 council atlas, ten blocks (blend pass only):
+
+| Pass | RGBA8 | RGBA16F |
+|---|---|---|
+| Frontier 1 full-atlas reference | 0.284 ms | 0.282 ms |
+| Frontier 2 edge bands, in place | 0.0040 ms | 0.0040 ms |
+| Frontier 3 coverage, whole blocks, in place | 0.0143 ms | 0.0254 ms |
+
+Coverage processes 323,520 block pixels instead of 73,344 edge pixels. Its extra memory is
+one R8 atlas, at most about 400 KB under the 400k-pixel budget. None of this is a game
+frame-time result.
+
+Tests added or extended, all passing on 2026-10-09: `tests/render-dump-probe.cpp`
+(hand-assembled SPIR-V, texel decode, alpha statistics, UV mapping, PNG checked against
+Python's zlib), reset attribution in `tests/portrait-atlas.cpp` (agrees with SameHistory on
+2,000 scenes), coverage scenarios in `tests/portrait-blend.cpp` (full, partial, zero and
+interior holes; mixed coverage/legacy blocks; coverage flags with nothing bound; an empty
+mask; three formats, typed and copy paths, three frame slots, WARP and RTX 3060; a mutation
+that drops the coverage multiply fails the test), `tests/Test-FrameStats.ps1` and
+`tests/Test-Frontier3Live.ps1` (fake game folder only). The dumper's in-game paths cannot
+run outside CK3 and are unverified until the first dump session.
+
+### Next steps, in order
+
+1. **User decision:** switch back to DLSS5Extended (`Install CK3 DLSS 5 Extended Test.cmd`
+   in the game folder, or `DLSS5-CK3.ps1 -Action Install -Profile DLSS5Extended`). Confirm
+   with `.\tools\Frontier3-Live.ps1 -Action Status`: profile DLSS5Extended, portrait settings
+   back, NeuralUplift 1.
+2. Launch once with the Frontier 2 feeder and confirm DLSS 5 evaluates (Status shows
+   "evaluation succeeded" lines and no failures). This separates profile problems from
+   Frontier 3 changes.
+3. Deploy: `.\tools\Frontier3-Live.ps1 -Action Deploy -Addon .\build\dlss5-feed.addon64`.
+   Launch normally and confirm the log says `ck3-frontier3-diag.1` and DLSS 5 still evaluates.
+4. Section 0: `-Action Configure -Set render_dump=1`, launch, capture the scenes in section 0
+   with Ctrl+Shift+F11 in each, close, `-Action Collect -Label dump`, then
+   `-Action Configure -Set render_dump=0`. The probe lines answer the section 2 question:
+   does the Portrait texture's alpha describe the character?
+5. Section 1: `-Action Configure -Set frame_stats=1` (can also be toggled live), repeat the
+   scenes, `-Action Collect -Label baseline`, then summarise with `tools/frame-stats.ps1`.
+6. Then the mask producer (below), using what step 4 found.
+
+### Still open
+
+- **Mask producer (section 2).** Build the coverage atlas on the GPU from the draw that the
+  dump identifies, in the same frame as the colour crop, transport it like `SLOT_MASK` but as
+  its own slot, and set `coverage_blocks` only for crops whose coverage matches. If the probe
+  shows opaque portrait alpha, trace the real coverage source first. Pixel tests for clipping
+  and overlapping source draws belong with the producer.
+- **Frame association (section 3).** Rectangles still come from a readback three frames late;
+  the dump will show whether that age matters. Identity-aware fixtures and slot-preserving
+  resets wait on real draw identity.
+- **Depth (section 4).** Untouched; still after mask and association work.
+- **GPU stage timing.** Not added; the CSV is CPU-side only and says so.
+
 ## Objective and priority
 
 Start with a render dump of the current build ([section 0](#0-render-dump-of-the-current-state-do-this-first)).
@@ -352,13 +450,18 @@ this path is exhausted from the outside.
 
 | File | Responsibility |
 |---|---|
-| `src/feed_render_dump.h` | Pipeline/descriptor tracking, draw metadata, readback and rectangle publication |
+| `src/feed_render_dump.h` | Pipeline/descriptor tracking, draw metadata, readback and rectangle publication; dump-mode texture identity and census probe |
+| `src/feed_dump_probe.h` | Game-independent probe helpers: SPIR-V bindings, texel decode, alpha statistics, UV mapping, PNG |
+| `src/feed_frame_stats.h` | `frame_stats=1` per-present CSV and log summaries |
 | `src/feed_portrait_atlas.h` | Candidate preparation, guarded placement, hard budget and history comparison |
 | `src/feed_portrait_blend.h` | GPU composition, scheduling, format capability checks and resources |
 | `src/feed_vk.h` | Vulkan imports, clears, copy/blit helpers and barriers |
 | `src/dlss5-feed.cpp` | Configuration, `FeedFrameVk`, shared slots, NGX contract, resets and lifecycle |
 | `tests/portrait-atlas.cpp`, `tests/vk-portrait-atlas.cpp` | Geometry invariants/replay and input pixel readback |
-| `tests/portrait-blend.cpp` | Independent CPU reference versus actual GPU shader output |
+| `tests/portrait-blend.cpp` | Independent CPU reference versus actual GPU shader output, including coverage compositing |
+| `tests/render-dump-probe.cpp` | Probe helpers against hand-assembled SPIR-V and synthetic textures |
+| `tools/frame-stats.ps1`, `tests/Test-FrameStats.ps1` | Capture summary/comparison and its fixture test |
+| `tools/Frontier3-Live.ps1`, `tests/Test-Frontier3Live.ps1` | Live-install helper and its fake-install test |
 | `tests/feeder-compat.cpp`, `tests/vk-present-order.cpp` | Submission failure handling, formats/config and present dependency ordering |
 
 From a checkout with the current dependencies and Visual Studio 2022 Build Tools:
@@ -369,6 +472,9 @@ cmd /c tests\test-portrait-atlas.cmd tests\fixtures\frontier2-session-crops.tsv
 .\build\compat-tests\portrait-atlas.exe tests\fixtures\frontier2-trace-crops.tsv
 cmd /c tests\test-portrait-blend.cmd
 cmd /c tests\test-feeder-compat.cmd
+cmd /c tests\test-render-dump-probe.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Test-FrameStats.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Test-Frontier3Live.ps1
 git diff --check
 ```
 

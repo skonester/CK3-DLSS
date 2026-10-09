@@ -165,7 +165,8 @@ static void Decode(const uint8_t *source, float values[4], DXGI_FORMAT format)
 }
 
 // Evaluate distance to each edge independently of the GPU scheduler and its jobs.
-static float Weight(const pblend::Cb &cb, UINT x, UINT y)
+// `coverage` (optional, one byte per atlas pixel) applies to blocks flagged in coverage_blocks.
+static float Weight(const pblend::Cb &cb, UINT x, UINT y, const std::vector<uint8_t> *coverage = nullptr, UINT stride = 0)
 {
     for (uint32_t i = 0; i < cb.count; ++i)
     {
@@ -176,9 +177,21 @@ static float Weight(const pblend::Cb &cb, UINT x, UINT y)
         float weight = 1;
         for (int side = 0; side < 4; ++side)
             if (feather[side]) weight = (std::min)(weight, (float(distance[side]) + .5f) / feather[side]);
+        if (coverage != nullptr && ((cb.coverage_blocks >> i) & 1u))
+            weight *= float((*coverage)[size_t(y) * stride + x]) / 255;
         return weight;
     }
     return 1;   // padding has no consumer and must retain the neural result
+}
+
+// Character coverage fixture: opaque centres, transparent corners and an interior hole,
+// a soft ramp, and every byte value somewhere, so zero/full/partial are all exercised.
+static uint8_t CoverageAt(UINT x, UINT y)
+{
+    if ((x / 5 + y / 3) % 11 == 0) return 0;                  // interior holes
+    if ((x + 2 * y) % 17 == 0) return uint8_t((x * 31 + y * 7) % 256);   // all byte values
+    const int band = int((x + y) % 64);
+    return band < 20 ? 255 : band < 30 ? 0 : uint8_t(band * 4);
 }
 
 struct Image
@@ -186,13 +199,16 @@ struct Image
     Device &d;
     UINT w, h, bytes;
     DXGI_FORMAT format;
-    ComPtr<ID3D12Resource> color, output, upload, readback;
+    ComPtr<ID3D12Resource> color, output, upload, readback, cover, cover_upload;
+    std::vector<uint8_t> coverage;   // one byte per pixel, tightly packed
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
     UINT64 plane_size = 0, neural_offset = 0;
     std::vector<uint8_t> originals;
 
-    Image(Device &device, UINT width, UINT height, DXGI_FORMAT fmt) : d(device), w(width), h(height), bytes(PixelBytes(fmt)), format(fmt)
+    Image(Device &device, UINT width, UINT height, DXGI_FORMAT fmt, int coverage_mode = 0)
+        : d(device), w(width), h(height), bytes(PixelBytes(fmt)), format(fmt)
     {
+        // coverage_mode: 0 none bound, 1 fixture pattern, 2 entirely empty mask
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h;
@@ -236,10 +252,40 @@ struct Image
         Barrier(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Barrier(output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         d.Submit();
-        Require(pblend::EnsureResources(d.dev.Get(), color.Get(), output.Get(), w, h, format, format), "prepare production blend");
+        if (coverage_mode != 0) MakeCoverage(coverage_mode);
+        Require(pblend::EnsureResources(d.dev.Get(), color.Get(), output.Get(), w, h, format, format, cover.Get()),
+                "prepare production blend");
         if (pblend::g_in_place) Require(pblend::g_nr_copy == nullptr, "typed path allocates no scratch atlas");
     }
     ~Image() { pblend::ReleaseTargets(); }
+    // The coverage atlas is created like the other shared atlas textures (enters D3D12 in COMMON).
+    void MakeCoverage(int mode)
+    {
+        coverage.resize(size_t(w) * h);
+        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) coverage[size_t(y) * w + x] = mode == 1 ? CoverageAt(x, y) : 0;
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h;
+        rd.DepthOrArraySize = rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8_UNORM; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        Check(d.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                             IID_PPV_ARGS(&cover)), "create shared coverage texture");
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {}; UINT64 size = 0;
+        d.dev->GetCopyableFootprints(&rd, 0, 1, 0, &fp, nullptr, nullptr, &size);
+        cover_upload = Buffer(d, size, D3D12_HEAP_TYPE_UPLOAD);
+        uint8_t *ptr; const D3D12_RANGE no_read = { 0, 0 };
+        Check(cover_upload->Map(0, &no_read, reinterpret_cast<void **>(&ptr)), "map coverage upload");
+        for (UINT y = 0; y < h; ++y) std::memcpy(ptr + size_t(y) * fp.Footprint.RowPitch, coverage.data() + size_t(y) * w, w);
+        cover_upload->Unmap(0, nullptr);
+        d.Begin();
+        Barrier(cover.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
+        from.pResource = cover_upload.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; from.PlacedFootprint = fp;
+        to.pResource = cover.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        d.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        Barrier(cover.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        d.Submit();
+    }
     void Copy(ID3D12Resource *dest, UINT64 offset)
     {
         D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
@@ -251,6 +297,7 @@ struct Image
     void Reset()
     {
         Barrier(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (cover) Barrier(cover.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         Copy(output.Get(), neural_offset);
         Barrier(output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -281,16 +328,21 @@ struct Image
         d.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
         Barrier(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (cover) Barrier(cover.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         d.Submit();
         uint8_t *ptr; const D3D12_RANGE range = { 0, size_t(plane_size) };
         Check(readback->Map(0, &range, reinterpret_cast<void **>(&ptr)), "map result");
         for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x)
         {
             const size_t offset = size_t(y) * footprint.Footprint.RowPitch + x * bytes;
-            const float weight = Weight(cb, x, y);
-            if (weight == 1)
+            // Without a bound coverage resource the production pass must ignore coverage flags.
+            const float weight = Weight(cb, x, y, cover ? &coverage : nullptr, w);
+            if (weight >= 1)
                 Require(std::memcmp(ptr + offset, originals.data() + neural_offset + offset, bytes) == 0,
-                        "interiors and atlas padding remain bit-exact");
+                        "interiors, full coverage and atlas padding remain bit-exact neural");
+            else if (weight <= 0)
+                Require(std::memcmp(ptr + offset, originals.data() + offset, bytes) == 0,
+                        "zero coverage restores the original pixel bit-exactly");
             else
             {
                 float source[4], neural[4], actual[4];
@@ -331,6 +383,7 @@ static void SchedulerTests()
     {
         constexpr UINT w = 137, h = 93;
         pblend::Cb cb = {}; cb.count = next() % 25;
+        cb.coverage_blocks = trial % 3 == 0 ? 0u : next();   // Frontier 3: mixed coverage and legacy blocks
         for (UINT i = 0; i < cb.count; ++i)
             cb.blocks[i] = { (i % 8) * 17, (i / 8) * 31, 1 + next() % 16, 1 + next() % 30,
                              next() % 65, next() % 65, next() % 65, next() % 65 };
@@ -342,6 +395,11 @@ static void SchedulerTests()
         {
             const auto &job = plan.jobs[i];
             Require(job.group_end > end && job.block < cb.count, "monotonic group tickets");
+            const auto &owner = cb.blocks[job.block];
+            const bool whole = ((cb.coverage_blocks >> job.block) & 1u) != 0;
+            Require(job.flags == (whole ? 1u : 0u), "coverage flag follows the block");
+            Require(!whole || (job.x == owner.x && job.y == owner.y && job.w == owner.w && job.h == owner.h),
+                    "a coverage block is one whole-block job");
             const UINT groups = job.groups_x * ((job.h - 1) / pblend::kGroupHeight + 1);
             Require(job.group_end - end == groups, "ticket count covers every edge tile");
             end = job.group_end;
@@ -350,7 +408,15 @@ static void SchedulerTests()
         }
         Require(end == plan.group_count, "final ticket matches dispatch count");
         for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x)
-            Require(visits[y * w + x] == (Weight(cb, x, y) < 1 ? 1u : 0u), "each feather pixel has exactly one owner");
+        {
+            UINT expected = Weight(cb, x, y) < 1 ? 1u : 0u;
+            for (UINT i = 0; i < cb.count; ++i)
+            {
+                const auto &b = cb.blocks[i];
+                if (((cb.coverage_blocks >> i) & 1u) && x >= b.x && y >= b.y && x - b.x < b.w && y - b.y < b.h) expected = 1;
+            }
+            Require(visits[y * w + x] == expected, "each feather or coverage pixel has exactly one owner");
+        }
     }
     pblend::Cb cb = {}; pblend::DispatchCb plan;
     cb.count = 1; cb.blocks[0] = { 0, 0, 16384, 16384, 16384, 16384, 16384, 16384 };
@@ -364,7 +430,7 @@ static void SchedulerTests()
     Require(!pblend::BuildDispatch(cb, 16384, 16384, plan), "excess block count rejected");
     cb.count = 0;
     Require(pblend::BuildDispatch(cb, 137, 93, plan) && plan.group_count == 0, "empty atlas has no dispatch");
-    std::puts("PASS scheduler: 128 randomized layouts, unique pixel ownership, bounds, large dispatch");
+    std::puts("PASS scheduler: 128 randomized layouts with mixed coverage blocks, unique pixel ownership, bounds, large dispatch");
 }
 
 static const char kReference[] = R"(
@@ -412,7 +478,8 @@ static void RecordReference(Image &image, ID3D12PipelineState *pso, const pblend
 
 static void Benchmark(Device &d, DXGI_FORMAT format)
 {
-    Image image(d, 640, 640, format); const auto cb = Council();
+    Image image(d, 640, 640, format, 1); const auto cb = Council();   // coverage bound; used only by mode 3
+    auto covered = cb; covered.coverage_blocks = (1u << cb.count) - 1;
     Require(pblend::SupportsInPlace(d.dev.Get(), format), "hardware benchmark supports typed loads");
     image.CopyPath();
     ComPtr<ID3DBlob> code, error;
@@ -432,17 +499,18 @@ static void Benchmark(Device &d, DXGI_FORMAT format)
     auto timestamps = Buffer(d, 16, D3D12_HEAP_TYPE_READBACK);
     UINT64 frequency; Check(d.queue->GetTimestampFrequency(&frequency), "timestamp frequency");
     auto run = [&](int mode, UINT count) {
-        d.Begin(); image.Reset(); pblend::g_in_place = mode == 2;
+        d.Begin(); image.Reset(); pblend::g_in_place = mode >= 2;
         d.list->EndQuery(query.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         for (UINT i = 0; i < count; ++i)
         {
             if (mode == 0) RecordReference(image, reference.Get(), cb);
-            else pblend::Record(d.list.Get(), image.output.Get(), 0, image.w, image.h, cb);
+            else pblend::Record(d.list.Get(), image.output.Get(), 0, image.w, image.h, mode == 3 ? covered : cb);
         }
         d.list->EndQuery(query.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         d.list->ResolveQueryData(query.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, timestamps.Get(), 0);
         Barrier(image.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Barrier(image.color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(image.cover.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         d.Submit();
         UINT64 *ticks; const D3D12_RANGE range = { 0, 16 };
         Check(timestamps->Map(0, &range, reinterpret_cast<void **>(&ticks)), "read GPU timestamps");
@@ -450,18 +518,23 @@ static void Benchmark(Device &d, DXGI_FORMAT format)
         const D3D12_RANGE no_write = { 0, 0 }; timestamps->Unmap(0, &no_write);
         return ms;
     };
-    for (int mode = 0; mode < 3; ++mode) run(mode, 16);
-    std::array<std::array<double, 5>, 3> samples;
+    for (int mode = 0; mode < 4; ++mode) run(mode, 16);
+    std::array<std::array<double, 5>, 4> samples;
     for (int trial = 0; trial < 5; ++trial)
-        for (int step = 0; step < 3; ++step)
-        { const int mode = (step + trial) % 3; samples[mode][trial] = run(mode, 128); }
+        for (int step = 0; step < 4; ++step)
+        { const int mode = (step + trial) % 4; samples[mode][trial] = run(mode, 128); }
     for (auto &sample : samples) std::sort(sample.begin(), sample.end());
     pblend::DispatchCb plan; Require(pblend::BuildDispatch(cb, image.w, image.h, plan), "benchmark dispatch");
     UINT pixels = 0; for (UINT i = 0; i < plan.job_count; ++i) pixels += plan.jobs[i].w * plan.jobs[i].h;
+    pblend::DispatchCb whole; Require(pblend::BuildDispatch(covered, image.w, image.h, whole), "coverage benchmark dispatch");
+    UINT covered_pixels = 0; for (UINT i = 0; i < whole.job_count; ++i) covered_pixels += whole.jobs[i].w * whole.jobs[i].h;
     std::printf("BENCH format=%d atlas=640x640 blocks=%u edge_pixels=%u groups=%u median_ms: "
                 "frontier1=%.6f copy_edges=%.6f in_place_edges=%.6f speedup=%.2fx\n",
                 int(format), cb.count, pixels, plan.group_count, samples[0][2], samples[1][2], samples[2][2],
                 samples[0][2] / samples[2][2]);
+    std::printf("BENCH format=%d coverage (Frontier 3): whole-block pixels=%u groups=%u in_place_coverage_ms=%.6f "
+                "(%.2fx the edge-only pass); extra memory: one R8 atlas, %u bytes at this size\n",
+                int(format), covered_pixels, whole.group_count, samples[3][2], samples[3][2] / samples[2][2], image.w * image.h);
 }
 
 static void GpuTests(Device &d, bool benchmark, bool hardware = false)
@@ -469,11 +542,26 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
     const DXGI_FORMAT formats[] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT };
     for (auto format : formats)
     {
-        for (int scenario = 0; scenario < 6; ++scenario)
+        // 6-9: Frontier 3 coverage. 6 council, all coverage; 7 tiny blocks, alternate coverage
+        // and legacy (a legacy block never reads the mask under it); 8 coverage flags with no
+        // coverage bound (must equal legacy); 9 entirely empty mask (no neural rectangle).
+        for (int scenario = 0; scenario < 10; ++scenario)
         {
-            UINT w = scenario == 0 ? 640 : 137, h = scenario == 0 ? 640 : 93;
+            UINT w = (scenario == 0 || scenario == 6 || scenario == 9) ? 640 : 137;
+            UINT h = (scenario == 0 || scenario == 6 || scenario == 9) ? 640 : 93;
             pblend::Cb cb = {};
-            if (scenario == 0) cb = Council();
+            int coverage_mode = 0;
+            if (scenario == 0 || scenario == 6 || scenario == 9) cb = Council();
+            if (scenario == 6 || scenario == 9) { cb.coverage_blocks = (1u << cb.count) - 1; coverage_mode = scenario == 6 ? 1 : 2; }
+            if (scenario == 7 || scenario == 8)
+            {
+                cb.count = 24;
+                for (UINT i = 0; i < cb.count; ++i)
+                    cb.blocks[i] = { (i % 8) * 17, (i / 8) * 31, 1 + (i * 7) % 16, 1 + (i * 13) % 30,
+                                     i % 3 ? 64u : 0u, i % 5 ? 3u : 0u, i % 7 ? 16u : 0u, i % 2 ? 0u : 64u };
+                cb.coverage_blocks = scenario == 7 ? 0x00AAAAAAu : 0x00FFFFFFu;
+                coverage_mode = scenario == 7 ? 1 : 0;
+            }
             else if (scenario == 1)
             {
                 cb.count = 24;
@@ -482,7 +570,7 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
                                      i % 3 ? 64u : 0u, i % 5 ? 3u : 0u, i % 7 ? 16u : 0u, i % 2 ? 0u : 64u };
             }
             else if (scenario == 2) { cb.count = 1; cb.blocks[0] = { 0, 0, w, h, 0, 0, 0, 0 }; }
-            else if (scenario >= 4)
+            else if (scenario == 4 || scenario == 5)
             {
                 std::vector<portrait::Rect> rects = {{0,0,380,421}};
                 for (int i = 0; i < 12; ++i) rects.push_back({600 + (i % 6) * 160, 100 + (i / 6) * 180, 80, 100});
@@ -507,7 +595,7 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
                         (it.edges & 1) ? 0u : 16u, (it.edges & 2) ? 0u : 16u,
                         (it.edges & 4) ? 0u : 16u, (it.edges & 8) ? 0u : 16u };
             }
-            Image image(d, w, h, format);
+            Image image(d, w, h, format, coverage_mode);
             const bool typed = pblend::g_in_place;
             for (int mode = 0; mode < (typed ? 2 : 1); ++mode)
             {
@@ -520,7 +608,8 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
                 }
             }
         }
-        std::printf("PASS GPU format=%d: council, 24 tiny blocks, zero feathers, empty, allocated and retired slots; three frame slots; typed=%d and copy fallback\n",
+        std::printf("PASS GPU format=%d: council, 24 tiny blocks, zero feathers, empty, allocated and retired slots; "
+                    "coverage: full/partial/zero/holes, mixed legacy blocks, unbound fallback, empty mask; three frame slots; typed=%d and copy fallback\n",
                     int(format), pblend::SupportsInPlace(d.dev.Get(), format));
     }
     if (hardware)

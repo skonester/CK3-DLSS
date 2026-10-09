@@ -21,6 +21,7 @@ affects CK3, and you can switch it off at any time.
 > **about 40 fps**, and CK3 now starts in seconds instead of minutes.
 > There is still a slight square box around portraits, most visible while zooming the map.
 > **The remaining mask fix and live validation are planned in [Frontier 3](frontier3.md).**
+> Frontier 3 diagnostics and the coverage blend are built and tested offline; live capture is next.
 > The download below is the previous release. [Read the full Frontier 1 log](frontier.md).
 > Frontier 2 now optimizes the portrait blend with edge-only compute and in-place GPU reads.
 > Persistent atlas slots now enforce the budget on the full texture and reduce rebuilds

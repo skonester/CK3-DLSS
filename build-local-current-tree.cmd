@@ -20,7 +20,7 @@ cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 ^
    /Fobuild\ /Fdbuild\ ^
    src\dlss5-feed.cpp ^
    external\minhook\src\buffer.c external\minhook\src\hook.c external\minhook\src\trampoline.c external\minhook\src\hde\hde64.c ^
-   /link /OUT:build\dlss5-feed.addon64 build\version.res external\ngx\libs\nvsdk_ngx_d.lib ^
+   /link /IMPLIB:build\dlss5-feed.lib /OUT:build\dlss5-feed.addon64 build\version.res external\ngx\libs\nvsdk_ngx_d.lib ^
    version.lib kernel32.lib user32.lib advapi32.lib ole32.lib
 
 exit /b %ERRORLEVEL%

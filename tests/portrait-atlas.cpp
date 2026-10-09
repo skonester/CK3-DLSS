@@ -134,6 +134,46 @@ static void RegressionTests()
     std::puts("PASS allocator regressions: persistent slots, history, growth/shrink, sparse scenes, reshape policy, clipping, hard budget");
 }
 
+// Frontier 3 reset attribution: each cause is reported, and only when SameHistory fails.
+static void HistoryChangeTests()
+{
+    portrait::Atlas a; a.w = 512; a.h = 512;
+    a.items = {{100,100,8,8,128,128,0}, {600,100,144,8,96,96,0}};
+    portrait::Atlas b = a;
+    Require(portrait::HistoryChange(a, b) == 0 && portrait::SameHistory(a, b), "identical layout has no reset cause");
+    b.items.pop_back();
+    Require(portrait::HistoryChange(a, b) == 0, "removal alone has no reset cause");
+    b = a; b.w = 528;
+    Require(portrait::HistoryChange(a, b) == portrait::kHistoryCanvas, "canvas change is attributed");
+    b = a; b.items[0].dx = 300;
+    Require(portrait::HistoryChange(a, b) == portrait::kHistoryMovedSlot, "same crop at a new address is a moved slot");
+    b = a; b.items[1].sx = 900;
+    Require(portrait::HistoryChange(a, b) == portrait::kHistoryTranslated, "same slot with a new screen origin is translated");
+    b = a; b.items[0].w = 144; b.items[0].sx = 92;
+    Require(portrait::HistoryChange(a, b) == portrait::kHistoryResized, "overlapping crop with a new rectangle is resized");
+    b = a; b.items.push_back({1200,700,8,300,64,64,0});
+    Require(portrait::HistoryChange(a, b) == portrait::kHistoryNewCrop, "unrelated crop is new");
+    b.w = 640; b.items[0].dx = 300;
+    Require(portrait::HistoryChange(a, b) == (portrait::kHistoryCanvas | portrait::kHistoryNewCrop | portrait::kHistoryMovedSlot),
+            "several causes are reported together");
+
+    uint32_t random = 0x5EEDF00D;
+    auto next = [&]() { random = random * 1664525 + 1013904223; return random; };
+    portrait::Atlas previous;
+    for (int scene = 0; scene < 2000; ++scene)
+    {
+        std::vector<portrait::Rect> rects;
+        for (uint32_t n = next() % 8; n > 0; --n)
+            rects.push_back({int(next() % 1800), int(next() % 980), int(48 + next() % 300), int(48 + next() % 300)});
+        portrait::Atlas current;
+        if (!portrait::Build(rects, 1920, 1080, {48, 16, 400000}, &previous, current)) continue;
+        Require((portrait::HistoryChange(previous, current) == 0) == portrait::SameHistory(previous, current),
+                "reset attribution agrees with SameHistory");
+        previous = std::move(current);
+    }
+    std::puts("PASS reset attribution: canvas, new crop, moved slot, translated, resized; agrees with SameHistory on 2000 scenes");
+}
+
 static void RandomizedTests()
 {
     uint32_t random = 0xA0A5CAFE;
@@ -166,6 +206,7 @@ static void Replay(const char *path)
     uint64_t old_pixels = 0, new_pixels = 0, old_peak = 0, new_peak = 0, slots = 0, old_slots = 0;
     uint64_t captured_crops = 0, selected_crops = 0;
     uint32_t rows = 0, old_resizes = 0, new_resizes = 0, resets = 0, prior_w = 0, prior_h = 0;
+    uint32_t causes[5] = {}, multi = 0;
     std::string line;
     const auto start = std::chrono::steady_clock::now();
     while (std::getline(stream, line))
@@ -190,6 +231,12 @@ static void Replay(const char *path)
         if (rows && (w != prior_w || h != prior_h)) ++old_resizes;
         if (rows && (current.w != previous.w || current.h != previous.h)) ++new_resizes;
         if (rows && !portrait::SameHistory(previous, current)) ++resets;
+        if (rows)
+        {
+            const uint32_t why = portrait::HistoryChange(previous, current);
+            for (int bit = 0; bit < 5; ++bit) if (why & (1u << bit)) ++causes[bit];
+            if (why != 0 && (why & (why - 1)) != 0) ++multi;
+        }
         slots += current.items.size(); old_slots += count;
         for (const auto &item : current.items) selected_crops += uint64_t(item.w) * item.h;
         prior_w = w; prior_h = h; previous = std::move(current); ++rows;
@@ -203,10 +250,12 @@ static void Replay(const char *path)
                 double(old_pixels) / rows, double(new_pixels) / rows, old_resizes, new_resizes, resets,
                 static_cast<unsigned long long>(slots), static_cast<unsigned long long>(old_slots),
                 static_cast<unsigned long long>(selected_crops), static_cast<unsigned long long>(captured_crops), ms / rows);
+    std::printf("REPLAY reset causes (a reset can have several): canvas=%u new_crop=%u moved_slot=%u translated=%u resized=%u; multi-cause resets=%u\n",
+                causes[0], causes[1], causes[2], causes[3], causes[4], multi);
 }
 
 int main(int argc, char **argv)
 {
     Require(argc <= 2, "usage: portrait-atlas.exe [captured-layouts.tsv]");
-    RegressionTests(); RandomizedTests(); if (argc == 2) Replay(argv[1]);
+    RegressionTests(); HistoryChangeTests(); RandomizedTests(); if (argc == 2) Replay(argv[1]);
 }

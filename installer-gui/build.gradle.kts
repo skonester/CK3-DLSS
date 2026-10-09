@@ -11,8 +11,8 @@ group = "com.ck3dlss"
 version = "1.0.0"
 
 kotlin {
-    jvmToolchain(17)
-    compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+    jvmToolchain(21)
+    compilerOptions.jvmTarget.set(JvmTarget.JVM_21)
 }
 
 dependencies {

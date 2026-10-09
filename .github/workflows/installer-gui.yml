@@ -1,0 +1,55 @@
+name: Installer GUI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "installer-gui/**"
+      - ".github/workflows/installer-gui.yml"
+  pull_request:
+    paths:
+      - "installer-gui/**"
+      - ".github/workflows/installer-gui.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: installer-gui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Test and build the Windows app
+        run: ./gradlew.bat --no-daemon test createReleaseDistributable
+
+      - name: Zip the app
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem build/compose/binaries/main-release/app -Directory | Select-Object -First 1
+          if (-not (Test-Path (Join-Path $app.FullName 'CK3 DLSS Installer.exe'))) { throw 'CK3 DLSS Installer.exe was not built' }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $app.FullName -DestinationPath dist/CK3-DLSS-Installer.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CK3-DLSS-Installer
+          path: installer-gui/dist/CK3-DLSS-Installer.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-reports
+          path: installer-gui/build/reports/tests/

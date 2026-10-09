@@ -1,6 +1,13 @@
 // Frontier 2: spend bandwidth on portrait edges, where blending actually changes a pixel.
 // Aquarius refuses the full-atlas copy tax; Sagittarius gives each edge pixel one owner.
 // Recorded after evaluation on the private D3D12 list. Atlas padding is never pasted home.
+//
+// Frontier 3 (section 2): a block flagged in Cb::coverage_blocks is composited with a character
+// coverage atlas (R8, same coordinates as the colour atlas): one job covers the whole block,
+// interior included, and out = src + (neural - src) * feather_weight * coverage. Coverage 0
+// restores the original pixel bit-exactly and coverage 1 keeps the neural pixel bit-exactly.
+// Unflagged blocks keep the legacy edge-band feather. Flags are ignored while no coverage
+// resource is bound, so a missing mask can only ever fall back to the legacy path.
 
 #pragma once
 
@@ -14,8 +21,11 @@ static constexpr UINT kGroupWidth = 16, kGroupHeight = 8;
 static constexpr UINT kCbSlot = 4096;   // per retired frame slot, 256-byte aligned
 
 struct Block { uint32_t x, y, w, h; uint32_t feather_l, feather_t, feather_r, feather_b; };
-struct Cb { uint32_t count, pad0, pad1, pad2; Block blocks[kMaxBlocks]; };
-struct EdgeJob { uint32_t x, y, w, h; uint32_t block, group_end, groups_x, pad; };
+// coverage_blocks: bit i set = block i is composited with the coverage atlas (Frontier 3).
+struct Cb { uint32_t count, coverage_blocks, pad1, pad2; Block blocks[kMaxBlocks]; };
+static_assert(kMaxBlocks <= 32, "coverage_blocks is a 32-bit mask");
+// flags bit 0: whole-block coverage job.
+struct EdgeJob { uint32_t x, y, w, h; uint32_t block, group_end, groups_x, flags; };
 struct DispatchCb
 {
     uint32_t job_count, group_count, dispatch_width, pad;
@@ -27,6 +37,7 @@ static_assert(sizeof(DispatchCb) <= kCbSlot, "blend constant buffer slot too sma
 
 // Disjoint bands give each pixel exactly one writer, including tiny portraits whose
 // feathers overlap. The CPU submits at most 96 jobs; the GPU never scans 24 blocks per pixel.
+// A coverage block is one job over the whole block: its interior changes too.
 static bool BuildDispatch(const Cb &cb, UINT w, UINT h, DispatchCb &out)
 {
     out = {};
@@ -42,21 +53,22 @@ static bool BuildDispatch(const Cb &cb, UINT w, UINT h, DispatchCb &out)
             if (b.x < a.x + a.w && a.x < b.x + b.w && b.y < a.y + a.h && a.y < b.y + b.h) return false;
         }
         out.blocks[i] = b;
-        auto add = [&](uint32_t x, uint32_t y, uint32_t rw, uint32_t rh) {
+        auto add = [&](uint32_t x, uint32_t y, uint32_t rw, uint32_t rh, uint32_t flags) {
             if (rw == 0 || rh == 0) return;
             const uint32_t gx = (rw - 1) / kGroupWidth + 1, gy = (rh - 1) / kGroupHeight + 1;
             out.group_count += gx * gy;
-            out.jobs[out.job_count++] = { x, y, rw, rh, i, out.group_count, gx, 0 };
+            out.jobs[out.job_count++] = { x, y, rw, rh, i, out.group_count, gx, flags };
         };
+        if ((cb.coverage_blocks >> i) & 1u) { add(b.x, b.y, b.w, b.h, 1); continue; }
         const uint32_t top = (std::min)(b.feather_t, b.h);
         const uint32_t bottom = (std::min)(b.feather_b, b.h - top);
         const uint32_t middle = b.h - top - bottom;
         const uint32_t left = (std::min)(b.feather_l, b.w);
         const uint32_t right = (std::min)(b.feather_r, b.w - left);
-        add(b.x, b.y, b.w, top);
-        add(b.x, b.y + b.h - bottom, b.w, bottom);
-        add(b.x, b.y + top, left, middle);
-        add(b.x + b.w - right, b.y + top, right, middle);
+        add(b.x, b.y, b.w, top, 0);
+        add(b.x, b.y + b.h - bottom, b.w, bottom, 0);
+        add(b.x, b.y + top, left, middle, 0);
+        add(b.x + b.w - right, b.y + top, right, middle, 0);
     }
     out.dispatch_width = (std::min)(out.group_count, UINT(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION));
     return true;
@@ -74,6 +86,7 @@ cbuffer Edges : register(b0)
 Texture2D<float4>   nr   : register(t0);
 #endif
 Texture2D<float4>   src  : register(t1);
+Texture2D<float>    cover: register(t2);   // character coverage atlas (null descriptor reads 0)
 RWTexture2D<float4> outp : register(u0);
 
 [numthreads(16, 8, 1)]
@@ -100,12 +113,15 @@ void main(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID)
     float4 feather = max(float4(block.feather), 1.0);
     float4 k = block.feather > 0 ? saturate(distance / feather) : 1.0;
     float weight = min(min(k.x, k.y), min(k.z, k.w));
+    if (job.schedule.w & 1) weight *= saturate(cover[pixel]);
 #if COSMIC_IN_PLACE
     float4 neural = outp[pixel];
 #else
     float4 neural = nr[pixel];
 #endif
-    outp[pixel] = lerp(src[pixel], neural, weight);
+    float4 source = src[pixel];
+    // Exact end points: no coverage is the original pixel, full coverage the neural one.
+    outp[pixel] = weight >= 1.0 ? neural : weight <= 0.0 ? source : lerp(source, neural, weight);
 }
 )";
 
@@ -116,6 +132,7 @@ static ID3D12Resource       *g_nr_copy;
 static ID3D12Resource       *g_cb;
 static uint8_t              *g_cb_ptr;
 static ID3D12Resource       *g_bound_color, *g_bound_output;   // what the descriptors point at
+static ID3D12Resource       *g_bound_cover;                   // coverage atlas, or nullptr (null descriptor)
 static bool                  g_failed;
 static bool                  g_in_place;
 
@@ -123,7 +140,7 @@ static bool                  g_in_place;
 static void ReleaseTargets()
 {
     SafeRelease(g_nr_copy);
-    g_bound_color = g_bound_output = nullptr;
+    g_bound_color = g_bound_output = g_bound_cover = nullptr;
 }
 
 static void Release()
@@ -136,7 +153,7 @@ static void Release()
     SafeRelease(g_pso[0]);
     SafeRelease(g_pso[1]);
     SafeRelease(g_rs);
-    g_bound_color = g_bound_output = nullptr;
+    g_bound_color = g_bound_output = g_bound_cover = nullptr;
     g_failed = false;
     g_in_place = false;
 }
@@ -172,10 +189,10 @@ static bool InitPipeline(ID3D12Device *dev, bool in_place)
     SafeRelease(err);
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 2; ranges[0].BaseShaderRegister = 0;
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 3; ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors = 1; ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER params[2] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -223,11 +240,13 @@ static bool SupportsInPlace(ID3D12Device *dev, DXGI_FORMAT format)
 }
 
 // Rebind after a feature rebuild. Only devices without typed loads pay for a scratch atlas.
+// `cover` (optional) is the R8_UNORM coverage atlas; it is bound with the other atlas resources
+// because the descriptor heap is shared by all frame slots and may only change on a rebuild.
 static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Resource *output,
-                            UINT w, UINT h, DXGI_FORMAT color_fmt, DXGI_FORMAT out_fmt)
+                            UINT w, UINT h, DXGI_FORMAT color_fmt, DXGI_FORMAT out_fmt, ID3D12Resource *cover = nullptr)
 {
     if (g_failed) return false;
-    if (g_bound_color == color && g_bound_output == output && g_cb_ptr != nullptr) return true;
+    if (g_bound_color == color && g_bound_output == output && g_bound_cover == cover && g_cb_ptr != nullptr) return true;
     g_in_place = SupportsInPlace(dev, out_fmt);
     if (!InitPipeline(dev, g_in_place)) { g_failed = true; return false; }
 
@@ -245,7 +264,7 @@ static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Reso
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 3;
+        hd.NumDescriptors = 4;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void **>(&g_heap));
     }
@@ -281,6 +300,9 @@ static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Reso
     sv.Format = color_fmt;
     dev->CreateShaderResourceView(color, &sv, h0);
     h0.ptr += inc;
+    sv.Format = DXGI_FORMAT_R8_UNORM;
+    dev->CreateShaderResourceView(cover, &sv, h0);   // nullptr: a null descriptor that reads 0
+    h0.ptr += inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {};
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     uv.Format = out_fmt;
@@ -288,15 +310,19 @@ static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Reso
 
     g_bound_color = color;
     g_bound_output = output;
-    Log("[feed] portrait blend ready (%ux%u, edge jobs, %s)", w, h,
-        g_in_place ? "Aquarius in-place UAV: no atlas copy" : "SRV copy fallback");
+    g_bound_cover = cover;
+    Log("[feed] portrait blend ready (%ux%u, edge jobs, %s%s)", w, h,
+        g_in_place ? "Aquarius in-place UAV: no atlas copy" : "SRV copy fallback",
+        cover != nullptr ? ", coverage atlas bound" : "");
     return true;
 }
 
-// Precondition: color in NON_PIXEL_SHADER_RESOURCE, output in UNORDERED_ACCESS (as left by the
-// evaluate). Leaves them in the same states.
-static void Record(ID3D12GraphicsCommandList *list, ID3D12Resource *output, int slot, UINT w, UINT h, const Cb &cb)
+// Precondition: color (and the coverage atlas, when bound) in NON_PIXEL_SHADER_RESOURCE, output
+// in UNORDERED_ACCESS (as left by the evaluate). Leaves them in the same states.
+static void Record(ID3D12GraphicsCommandList *list, ID3D12Resource *output, int slot, UINT w, UINT h, const Cb &request)
 {
+    Cb cb = request;
+    if (g_bound_cover == nullptr) cb.coverage_blocks = 0;   // no mask: legacy edge feather only
     DispatchCb dispatch;
     if (slot < 0 || slot >= Feed::kFrames || !BuildDispatch(cb, w, h, dispatch))
     {
