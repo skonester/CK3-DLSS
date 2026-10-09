@@ -48,13 +48,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path $app.FullName -DestinationPath dist/CK3-DLSS-Installer.zip -CompressionLevel Optimal
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: CK3-DLSS-Installer
           path: installer-gui/dist/CK3-DLSS-Installer.zip
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: test-reports
@@ -62,7 +62,8 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
+    # Every push to main that changes the app or package, a v* tag, or a manual run with a tag.
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || github.event.inputs.release_tag != ''
     runs-on: windows-latest
     permissions:
       contents: write
@@ -71,7 +72,7 @@ jobs:
         with:
           lfs: true    # the DLSS runtime files live in Git LFS
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: CK3-DLSS-Installer
           path: artifact
@@ -98,7 +99,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+          TAG: ${{ github.event.inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('v1.0.{0}', github.run_number) }}
         run: |
           $notes = @'
           **Download CK3-DLSS.zip below.**
