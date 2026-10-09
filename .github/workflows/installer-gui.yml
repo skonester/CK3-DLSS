@@ -3,33 +3,39 @@ name: Installer GUI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "installer-gui/**"
+      - "ck3-package/**"
       - ".github/workflows/installer-gui.yml"
   pull_request:
     paths:
       - "installer-gui/**"
       - ".github/workflows/installer-gui.yml"
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (for example v1.0.1). Leave empty to only build."
+        required: false
+        default: ""
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: installer-gui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          lfs: false   # the app doesn't need the runtime files
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
-
-      - uses: gradle/actions/setup-gradle@v4
 
       - name: Test and build the Windows app
         run: ./gradlew.bat --no-daemon test createReleaseDistributable
@@ -42,14 +48,66 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path $app.FullName -DestinationPath dist/CK3-DLSS-Installer.zip -CompressionLevel Optimal
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: CK3-DLSS-Installer
           path: installer-gui/dist/CK3-DLSS-Installer.zip
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: test-reports
           path: installer-gui/build/reports/tests/
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true    # the DLSS runtime files live in Git LFS
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: CK3-DLSS-Installer
+          path: artifact
+
+      - name: Assemble CK3-DLSS.zip
+        shell: pwsh
+        run: |
+          # Every runtime must be the real file, not an LFS pointer.
+          Get-ChildItem ck3-package/binaries/dlss-payload/runtimes -Recurse -File | ForEach-Object {
+            if ($_.Length -lt 100000) { throw "$($_.FullName) is only $($_.Length) bytes (LFS pointer?)" }
+          }
+          $pkg = 'dist/CK3-DLSS'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item ck3-package $pkg -Recurse
+          Remove-Item "$pkg/tools/CK3-DLSS-Installer" -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive artifact/CK3-DLSS-Installer.zip -DestinationPath "$pkg/tools/unzipped"
+          Move-Item (Get-ChildItem "$pkg/tools/unzipped" -Directory | Select-Object -First 1).FullName "$pkg/tools/CK3-DLSS-Installer"
+          Remove-Item "$pkg/tools/unzipped" -Recurse -Force
+          if (-not (Test-Path "$pkg/tools/CK3-DLSS-Installer/CK3 DLSS Installer.exe")) { throw 'installer app missing from the package' }
+          Compress-Archive -Path "$pkg/*" -DestinationPath dist/CK3-DLSS.zip -CompressionLevel Optimal
+          "{0:N0} MB" -f ((Get-Item dist/CK3-DLSS.zip).Length / 1MB)
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          $notes = @'
+          **Download CK3-DLSS.zip below.**
+
+          1. Extract it anywhere.
+          2. Open `tools\CK3-DLSS-Installer\CK3 DLSS Installer.exe`.
+          3. Pick a profile, tick the license box, press Install. The app copies everything into your Crusader Kings III folder.
+          4. Press Launch CK3. In game, **F6** turns DLSS 5 on or off and **Home** opens the ReShade menu.
+
+          To remove everything, open the app and press Uninstall.
+          '@
+          gh release create $env:TAG dist/CK3-DLSS.zip --title "CK3 DLSS $env:TAG" --notes $notes --target $env:GITHUB_SHA
