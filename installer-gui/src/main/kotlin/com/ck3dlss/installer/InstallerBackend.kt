@@ -448,14 +448,31 @@ class InstallerBackend(
         generateSequence(location) { it.parent }.firstOrNull { it.name.equals("CK3-DLSS-Installer", ignoreCase = true) } ?: location
     }.getOrNull()
 
+    /**
+     * Removes the app's own folder once it has exited. The cleanup process must not hold that folder:
+     * it starts in the temp folder (not the app folder, the inherited working directory) and through
+     * startWithCleanDllSearch (not with the app's runtime\bin as its DLL directory). It waits for both
+     * the JVM and the launcher that started it, then retries for a while in case Windows is slow to
+     * release the files.
+     */
     private fun scheduleRemovalAfterExit(paths: List<Path>, tools: Path, onLine: (String) -> Unit) {
         fun quote(p: Path) = "'" + p.toString().replace("'", "''") + "'"
+        val pids = listOfNotNull(ProcessHandle.current().pid(), ProcessHandle.current().parent().map { it.pid() }.orElse(null))
         val script = buildString {
-            append("Wait-Process -Id ${ProcessHandle.current().pid()} -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; ")
-            paths.forEach { append("Remove-Item -LiteralPath ${quote(it)} -Recurse -Force -ErrorAction SilentlyContinue; ") }
-            append("if ((Test-Path -LiteralPath ${quote(tools)}) -and -not (Get-ChildItem -LiteralPath ${quote(tools)} -Force)) { Remove-Item -LiteralPath ${quote(tools)} -Force }")
+            append("Wait-Process -Id ${pids.joinToString(",")} -ErrorAction SilentlyContinue\n")
+            append("for (${'$'}i = 0; ${'$'}i -lt 30; ${'$'}i++) {\n")
+            paths.forEach { append("  Remove-Item -LiteralPath ${quote(it)} -Recurse -Force -ErrorAction SilentlyContinue\n") }
+            append("  if (-not (${paths.joinToString(" -or ") { "(Test-Path -LiteralPath ${quote(it)})" }})) { break }\n")
+            append("  Start-Sleep -Seconds 1\n}\n")
+            append("if ((Test-Path -LiteralPath ${quote(tools)}) -and -not (Get-ChildItem -LiteralPath ${quote(tools)} -Force)) { Remove-Item -LiteralPath ${quote(tools)} -Force }\n")
         }
-        ProcessBuilder(findPowerShell(), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script).start()
+        val encoded = java.util.Base64.getEncoder().encodeToString(script.toByteArray(Charsets.UTF_16LE))
+        val temp = Path.of(System.getProperty("java.io.tmpdir"))
+        startWithCleanDllSearch(
+            Path.of(findPowerShell()),
+            listOf("-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded),
+            temp, emptyMap(),
+        )
         onLine("The installer's own folder will be removed when this window closes.")
     }
 

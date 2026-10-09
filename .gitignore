@@ -17,6 +17,8 @@ build/
 # add-on build outputs ignored, including third-party runtime add-ons.
 !ck3-package/binaries/dlss-payload/
 !ck3-package/binaries/dlss-payload/dlss5-feed.addon64
+# Runtime files shipped inside the package (stored with Git LFS, see .gitattributes).
+!ck3-package/binaries/dlss-payload/runtimes/**
 
 # NVIDIA NGX SDK (bring your own — see external/ngx/README.md); not redistributed here
 external/ngx/*.h

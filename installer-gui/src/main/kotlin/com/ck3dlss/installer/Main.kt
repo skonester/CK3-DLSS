@@ -108,6 +108,14 @@ private sealed interface Outcome {
 }
 
 fun main(args: Array<String>) {
+    // "CK3 DLSS Installer.exe --uninstall <game folder>": the same uninstall as the button, no window.
+    if (args.firstOrNull() == "--uninstall") {
+        val target = args.getOrNull(1) ?: InstallerBackend(InstallerBackend.locatePackageRoot()).defaultGameRoot().toString()
+        val backend = InstallerBackend(InstallerBackend.locatePackageRoot())
+        val result = backend.uninstall(java.nio.file.Path.of(target)) { println(it) }
+        println(result.summary)
+        kotlin.system.exitProcess(result.exitCode)
+    }
     runCatching { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()) }
     val explicitRoot = args.indexOf("--package-root")
         .takeIf { it >= 0 && it + 1 < args.size }
