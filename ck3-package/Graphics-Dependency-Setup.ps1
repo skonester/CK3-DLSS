@@ -31,6 +31,8 @@ $script:VortArchiveSha256 = '231ba34a75556f9943e359559a89b0d0cc2caa322d9dcdee563
 $script:LiliumVersion = '2026.02.28'
 $script:LiliumSource = 'https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/releases/tag/2026.02.28'
 $script:LiliumArchiveSha256 = '3dc9f9dd70c9ae7dfbb3d770032afbc1998d46aece4ee247460462ed53815488'
+# HDR-only Lilium effects: CK3 renders SDR, so ReShade only ever lists them as (ERROR). Not shipped.
+$script:LiliumHdrOnly = @('lilium__hdr_black_floor_fix.fx', 'lilium__hdr_brightness_adjustment.fx', 'lilium__inverse_tone_mapping.fx', 'lilium__map_sdr_into_hdr.fx', 'lilium__test_pattern_generator.fx', 'lilium__tone_mapping.fx')
 
 
 function Write-GraphicsStatus([string]$Message) {
@@ -206,7 +208,7 @@ function Test-GraphicsDependencies([string]$BinaryRoot) {
         'third-party\\vort_Shaders\\Shaders\\vort_Motion.fx',
         'third-party\\vort_Shaders\\Shaders\\Includes\\vort_MotionUtils.fxh',
         'third-party\\vort_Shaders\\LICENSE',
-        'reshade-shaders\Shaders\Lilium\lilium__tone_mapping.fx',
+        'reshade-shaders\Shaders\Lilium\lilium__cas_hdr.fx',
         'reshade-shaders\Shaders\Lilium\lilium__include\include_main.fxh',
         'reshade-shaders\Textures\Lilium\lilium__blue_noise_64x64.png',
         'CK3-DLSS-GRAPHICS.json'
@@ -221,7 +223,7 @@ function Test-GraphicsDependencies([string]$BinaryRoot) {
     $liliumTextureRoot = Join-Path $BinaryRoot 'reshade-shaders\Textures\Lilium'
     $liliumShaderCount = @(Get-ChildItem -LiteralPath $liliumShaderRoot -Recurse -File).Count
     $liliumTextureCount = @(Get-ChildItem -LiteralPath $liliumTextureRoot -Recurse -File).Count
-    if ($liliumShaderCount -ne 44 -or $liliumTextureCount -ne 3) {
+    if ($liliumShaderCount -ne 38 -or $liliumTextureCount -ne 3) {
         throw "The bundled Lilium payload is incomplete: $liliumShaderCount shader files, $liliumTextureCount textures."
     }
 
@@ -252,6 +254,10 @@ function Confirm-DependencyInstall {
 }
 
 function Install-GraphicsDependencies([string]$BinaryRoot, [string]$DownloadRoot) {
+    foreach ($name in $script:LiliumHdrOnly) {
+        $stale = Join-Path $BinaryRoot "reshade-shaders\Shaders\Lilium\$name"
+        if (Test-Path -LiteralPath $stale -PathType Leaf) { Remove-Item -LiteralPath $stale -Force }
+    }
     if (-not $ForceDownload) {
         try { return Test-GraphicsDependencies $BinaryRoot }
         catch { Write-GraphicsStatus 'A complete validated graphics installation was not found; assembling it now.' }
@@ -325,7 +331,7 @@ function Install-GraphicsDependencies([string]$BinaryRoot, [string]$DownloadRoot
                     Version = $script:LiliumVersion
                     Source = $script:LiliumSource
                     ArchiveSha256 = $script:LiliumArchiveSha256
-                    ShaderFiles = 44
+                    ShaderFiles = 38
                     TextureFiles = 3
                     License = 'GPL-3.0 (complete shader source and license bundled)'
                 }

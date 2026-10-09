@@ -158,8 +158,8 @@ $liliumShaderRoot = Join-Path $template 'binaries\reshade-shaders\Shaders\Lilium
 $liliumTextureRoot = Join-Path $template 'binaries\reshade-shaders\Textures\Lilium'
 $liliumLicense = Join-Path $template 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt'
 foreach ($required in @(
-    (Join-Path $liliumShaderRoot 'lilium__tone_mapping.fx'),
-    (Join-Path $liliumShaderRoot 'lilium__inverse_tone_mapping.fx'),
+    (Join-Path $liliumShaderRoot 'lilium__cas_hdr.fx'),
+    (Join-Path $liliumShaderRoot 'lilium__rcas_hdr.fx'),
     (Join-Path $liliumShaderRoot 'lilium__include\include_main.fxh'),
     (Join-Path $liliumTextureRoot 'lilium__blue_noise_64x64.png'),
     $liliumLicense
@@ -168,7 +168,7 @@ foreach ($required in @(
 }
 $liliumShaderCount = @(Get-ChildItem -LiteralPath $liliumShaderRoot -Recurse -File).Count
 $liliumTextureCount = @(Get-ChildItem -LiteralPath $liliumTextureRoot -Recurse -File).Count
-if ($liliumShaderCount -ne 44 -or $liliumTextureCount -ne 3) {
+if ($liliumShaderCount -ne 38 -or $liliumTextureCount -ne 3) {
     throw "The bundled Lilium 2026.02.28 payload is incomplete: $liliumShaderCount shader files, $liliumTextureCount textures."
 }
 

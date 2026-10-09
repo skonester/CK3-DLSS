@@ -177,6 +177,9 @@ class InstallerBackendTest {
             "tools/CK3-DLSS-Installer/CK3 DLSS Installer.exe",
         )
         files.forEach { pkg.resolve(it).also { f -> f.parent.createDirectories(); f.writeText("package $it") } }
+        // Simulate a zip extracted with times hours in the future.
+        val future = java.nio.file.attribute.FileTime.from(java.time.Instant.now().plusSeconds(5 * 3600))
+        files.forEach { Files.setLastModifiedTime(pkg.resolve(it), future) }
         val backend = InstallerBackend(pkg) { false }
         assertTrue(backend.packageReady(), "complete package recognised")
         assertFalse(InstallerBackend(packageRoot()).packageReady(), "a package without the bootstrap files is not ready")
@@ -188,6 +191,10 @@ class InstallerBackendTest {
         files.filter { it != "binaries/ReShade.ini" }.forEach { assertEquals("package $it", Files.readString(game.resolve(it)), it) }
         assertEquals("user settings", Files.readString(game.resolve("binaries/ReShade.ini")), "existing ReShade settings kept")
         assertTrue(InstallerBackend.isCompletePackage(game), "the game folder now holds a complete package")
+        val latest = java.time.Instant.now().plusSeconds(60)
+        files.filter { it != "binaries/ReShade.ini" }.forEach {
+            assertTrue(Files.getLastModifiedTime(game.resolve(it)).toInstant().isBefore(latest), "$it is not future-dated")
+        }
     }
 
     @Test

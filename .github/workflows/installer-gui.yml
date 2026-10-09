@@ -110,6 +110,9 @@ jobs:
           Move-Item (Get-ChildItem "$pkg/tools/unzipped" -Directory | Select-Object -First 1).FullName "$pkg/tools/CK3-DLSS-Installer"
           Remove-Item "$pkg/tools/unzipped" -Recurse -Force
           if (-not (Test-Path "$pkg/tools/CK3-DLSS-Installer/CK3 DLSS Installer.exe")) { throw 'installer app missing from the package' }
+          # Zip times carry no time zone; stamp everything a day back so no user extracts future-dated files.
+          $stamp = (Get-Date).AddDays(-1)
+          Get-ChildItem $pkg -Recurse -File | ForEach-Object { $_.LastWriteTime = $stamp }
           Compress-Archive -Path "$pkg/*" -DestinationPath dist/CK3-DLSS.zip -CompressionLevel Optimal
           "{0:N0} MB" -f ((Get-Item dist/CK3-DLSS.zip).Length / 1MB)
 

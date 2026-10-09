@@ -99,8 +99,8 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\dlss5-vulkan\ReShade64.dll') -PathType Leaf)) 'Bootstrap unexpectedly redistributes ReShade64.dll.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\ReShade.fxh') -PathType Leaf)) 'Bootstrap unexpectedly redistributes ReShade.fxh.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\third-party\vort_Shaders') -PathType Container)) 'Bootstrap unexpectedly redistributes VORT.'
-    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__tone_mapping.fx') -PathType Leaf) 'Bootstrap is missing Lilium tone mapping.'
-    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__inverse_tone_mapping.fx') -PathType Leaf) 'Bootstrap is missing Lilium inverse tone mapping.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__cas_hdr.fx') -PathType Leaf) 'Bootstrap is missing Lilium CAS.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__rcas_hdr.fx') -PathType Leaf) 'Bootstrap is missing Lilium RCAS.'
     Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Textures\Lilium\lilium__blue_noise_64x64.png') -PathType Leaf) 'Bootstrap is missing Lilium textures.'
     Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt') -PathType Leaf) 'Bootstrap is missing the Lilium GPL license.'
 

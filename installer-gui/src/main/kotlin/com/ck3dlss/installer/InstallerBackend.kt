@@ -115,6 +115,9 @@ class InstallerBackend(
                 if (relText in KeepUserCopy && dest.exists()) return@forEach
                 Files.createDirectories(dest.parent)
                 Files.copy(file, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                // Windows copies keep the source time. Zips built on a UTC server extract with times
+                // hours in the future, and ReShade then refuses to save its config or preset.
+                Files.setLastModifiedTime(dest, java.nio.file.attribute.FileTime.from(Instant.now()))
                 copied++
             }
         }
