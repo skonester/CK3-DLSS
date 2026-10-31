@@ -238,6 +238,18 @@ static void FeedVkCopyRegion(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImag
     vk->CmdCopyImage(cb, src, src_layout, dst, dst_layout, 1, &c);
 }
 
+// Copy a whole mip/layer of a game image (texture-space portraits) to an offset in our image.
+static void FeedVkCopySub(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout, uint32_t level, uint32_t layer,
+                          VkImage dst, VkImageLayout dst_layout, int dx, int dy, UINT w, UINT h)
+{
+    VkImageCopy c = {};
+    c.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+    c.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    c.dstOffset      = { dx, dy, 0 };
+    c.extent         = { w, h, 1 };
+    vk->CmdCopyImage(cb, src, src_layout, dst, dst_layout, 1, &c);
+}
+
 static void FeedVkBlitRegion(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                              VkImage dst, VkImageLayout dst_layout, int sx, int sy, int dx, int dy, UINT w, UINT h)
 {
@@ -251,6 +263,21 @@ static void FeedVkBlitRegion(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImag
     vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_NEAREST);
 }
 
+// Scaled blit from one subresource of a game image (coverage atlas). Source offsets may be
+// reversed on an axis to mirror it; linear filtering keeps scaled silhouette edges soft.
+static void FeedVkBlitScaled(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout, uint32_t level, uint32_t layer,
+                             VkImage dst, VkImageLayout dst_layout, int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1)
+{
+    VkImageBlit bl = {};
+    bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+    bl.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    bl.srcOffsets[0]  = { sx0, sy0, 0 };
+    bl.srcOffsets[1]  = { sx1, sy1, 1 };
+    bl.dstOffsets[0]  = { dx0, dy0, 0 };
+    bl.dstOffsets[1]  = { dx1, dy1, 1 };
+    vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_LINEAR);
+}
+
 // Fill one of our GENERAL images with a constant (portrait atlas depth: a flat plane).
 static void FeedVkClear(FeedVk *vk, VkCommandBuffer cb, VkImage img, float value)
 {
@@ -262,11 +289,14 @@ static void FeedVkClear(FeedVk *vk, VkCommandBuffer cb, VkImage img, float value
 
 // Portrait inputs: deterministic padding and retired slots. A transfer write
 // dependency makes the subsequent crop copies win over these whole-image clears.
-static void FeedVkClearAtlas(FeedVk *vk, VkCommandBuffer cb, VkImage color, VkImage mask)
+// The optional coverage atlas starts at zero too: an uncovered pixel keeps its original value.
+static void FeedVkClearAtlas(FeedVk *vk, VkCommandBuffer cb, VkImage color, VkImage mask, VkImage cover = VK_NULL_HANDLE)
 {
-    const VkImage images[2] = { color, mask };
-    const uint32_t count = mask != VK_NULL_HANDLE ? 2u : 1u;
-    VkImageMemoryBarrier cleared[2] = {};
+    VkImage images[3] = { color };
+    uint32_t count = 1;
+    if (mask != VK_NULL_HANDLE) images[count++] = mask;
+    if (cover != VK_NULL_HANDLE) images[count++] = cover;
+    VkImageMemoryBarrier cleared[3] = {};
     for (uint32_t i = 0; i < count; ++i)
     {
         FeedVkClear(vk, cb, images[i], 0.0f);

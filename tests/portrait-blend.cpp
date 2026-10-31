@@ -208,7 +208,8 @@ struct Image
     Image(Device &device, UINT width, UINT height, DXGI_FORMAT fmt, int coverage_mode = 0)
         : d(device), w(width), h(height), bytes(PixelBytes(fmt)), format(fmt)
     {
-        // coverage_mode: 0 none bound, 1 fixture pattern, 2 entirely empty mask
+        // coverage_mode: 0 none bound, 1 fixture pattern, 2 entirely empty mask, 3 fixture pattern in
+        // the alpha of an RGBA8 atlas whose colour channels are decoys (the feeder's portrait-alpha atlas)
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h;
@@ -253,7 +254,7 @@ struct Image
         Barrier(output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         d.Submit();
         if (coverage_mode != 0) MakeCoverage(coverage_mode);
-        Require(pblend::EnsureResources(d.dev.Get(), color.Get(), output.Get(), w, h, format, format, cover.Get()),
+        Require(pblend::EnsureResources(d.dev.Get(), color.Get(), output.Get(), w, h, format, format, cover.Get(), coverage_mode == 3),
                 "prepare production blend");
         if (pblend::g_in_place) Require(pblend::g_nr_copy == nullptr, "typed path allocates no scratch atlas");
     }
@@ -262,11 +263,24 @@ struct Image
     void MakeCoverage(int mode)
     {
         coverage.resize(size_t(w) * h);
-        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) coverage[size_t(y) * w + x] = mode == 1 ? CoverageAt(x, y) : 0;
+        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) coverage[size_t(y) * w + x] = mode != 2 ? CoverageAt(x, y) : 0;
+        const UINT texel = mode == 3 ? 4 : 1;
+        std::vector<uint8_t> texels(size_t(w) * h * texel);
+        for (size_t i = 0; i < coverage.size(); ++i)
+            if (texel == 1) texels[i] = coverage[i];
+            else
+            {
+                const uint8_t a = coverage[i];
+                texels[i * 4 + 0] = uint8_t(255 - a);   // a pass reading red would see inverted coverage
+                texels[i * 4 + 1] = uint8_t(i * 37);
+                texels[i * 4 + 2] = uint8_t(i * 101 + 7);
+                texels[i * 4 + 3] = a;
+            }
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h;
-        rd.DepthOrArraySize = rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8_UNORM; rd.SampleDesc.Count = 1;
+        rd.DepthOrArraySize = rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Format = mode == 3 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
         Check(d.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                              IID_PPV_ARGS(&cover)), "create shared coverage texture");
@@ -275,7 +289,8 @@ struct Image
         cover_upload = Buffer(d, size, D3D12_HEAP_TYPE_UPLOAD);
         uint8_t *ptr; const D3D12_RANGE no_read = { 0, 0 };
         Check(cover_upload->Map(0, &no_read, reinterpret_cast<void **>(&ptr)), "map coverage upload");
-        for (UINT y = 0; y < h; ++y) std::memcpy(ptr + size_t(y) * fp.Footprint.RowPitch, coverage.data() + size_t(y) * w, w);
+        for (UINT y = 0; y < h; ++y)
+            std::memcpy(ptr + size_t(y) * fp.Footprint.RowPitch, texels.data() + size_t(y) * w * texel, size_t(w) * texel);
         cover_upload->Unmap(0, nullptr);
         d.Begin();
         Barrier(cover.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -544,15 +559,21 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
     {
         // 6-9: Frontier 3 coverage. 6 council, all coverage; 7 tiny blocks, alternate coverage
         // and legacy (a legacy block never reads the mask under it); 8 coverage flags with no
-        // coverage bound (must equal legacy); 9 entirely empty mask (no neural rectangle).
-        for (int scenario = 0; scenario < 10; ++scenario)
+        // coverage bound (must equal legacy); 9 entirely empty mask (no neural rectangle);
+        // 10 council, coverage in the alpha of an RGBA8 atlas (the feeder's portrait-alpha path).
+        for (int scenario = 0; scenario < 11; ++scenario)
         {
-            UINT w = (scenario == 0 || scenario == 6 || scenario == 9) ? 640 : 137;
-            UINT h = (scenario == 0 || scenario == 6 || scenario == 9) ? 640 : 93;
+            const bool council = scenario == 0 || scenario == 6 || scenario == 9 || scenario == 10;
+            UINT w = council ? 640 : 137;
+            UINT h = council ? 640 : 93;
             pblend::Cb cb = {};
             int coverage_mode = 0;
-            if (scenario == 0 || scenario == 6 || scenario == 9) cb = Council();
-            if (scenario == 6 || scenario == 9) { cb.coverage_blocks = (1u << cb.count) - 1; coverage_mode = scenario == 6 ? 1 : 2; }
+            if (council) cb = Council();
+            if (scenario == 6 || scenario == 9 || scenario == 10)
+            {
+                cb.coverage_blocks = (1u << cb.count) - 1;
+                coverage_mode = scenario == 6 ? 1 : scenario == 9 ? 2 : 3;
+            }
             if (scenario == 7 || scenario == 8)
             {
                 cb.count = 24;
@@ -609,7 +630,7 @@ static void GpuTests(Device &d, bool benchmark, bool hardware = false)
             }
         }
         std::printf("PASS GPU format=%d: council, 24 tiny blocks, zero feathers, empty, allocated and retired slots; "
-                    "coverage: full/partial/zero/holes, mixed legacy blocks, unbound fallback, empty mask; three frame slots; typed=%d and copy fallback\n",
+                    "coverage: full/partial/zero/holes, mixed legacy blocks, unbound fallback, empty mask, RGBA8 alpha atlas; three frame slots; typed=%d and copy fallback\n",
                     int(format), pblend::SupportsInPlace(d.dev.Get(), format));
     }
     if (hardware)

@@ -73,6 +73,62 @@ run outside CK3 and are unverified until the first dump session.
 
 ### Next steps, in order
 
+2026-10-31: step 1 is done (Status: DLSS5Extended, portrait settings, NeuralUplift 1; feeder
+`ck3-frontier2-atlas.1`, SHA-256 `27829e21…` from the package). Step 2 passed: feature 18
+created at each atlas size, evaluations succeeded, no failures. `ck3-frontier3-diag.1`
+(SHA-256 `a47ef567…`, all suites pass) is deployed to both copies; backup
+`binaries/dlss-backups/frontier3-20261031T200548Z-27829e21`.
+
+Section 0 dump (`build/frontier3-dump-20261031T201621Z`, 5 captures): every Portrait texture is
+R8G8B8A8_UNORM, alpha is a clean silhouette (edge ring 68-91% zero, partial 0.2-1.7%), UV
+mappings are identity or X-mirror only. The map ruler portrait is 472x472 at -81,629 (473x473
+texture); the user saw its neural box on the map.
+
+Mask producer built: `ck3-frontier3-cover.1` (SHA-256 `eb819223…`), `portrait_coverage=1`
+(start-up). The detector publishes each widget's Portrait texture (resource + generation); the
+feeder blits its alpha into an RGBA8 `SLOT_COVER` atlas per block (`src/feed_portrait_cover.h`
+plans it) and the blend reads alpha via the SRV component mapping. A block falls back to the
+edge feather if any widget in it has no usable source, widgets overlap inside it, or the texture
+was not sampled in the current frame. Known gaps: the GUI frame Mask texture is not multiplied
+in; the scissor is not applied. Tests: `tests/portrait-cover.cpp` (planner + Vulkan pixel
+oracle), blend scenario 10 (RGBA8 alpha atlas with decoy colour). Deployed with coverage on;
+backup `frontier3-20261031T203114Z-a47ef567`.
+
+Live, cover.1: load-screen box gone (user). The in-game ruler-portrait block flickered between
+masked and fallback every ~0.1-1 s, worst on hover (`build/frontier3-cover1-20261031T204046Z`).
+The shader source (`game/gfx/FX/gui_painterly_portrait.shader`) gives the UV rule:
+`(UV1 - PortraitUVOffset) / PortraitUVScale`, then `* Mask.a` (Mask sampled at UV1). cover.2
+(SHA-256 `5534c2e9…`) maps any UV transform and logs fallback reasons per block (overlap,
+no_source, unusable, no_widget; sources stale/unsupported).
+
+Live, cover.2 (`build/frontier3-cover2-20261031T204730Z`): box still flashes on the ruler
+portrait. Every fallback was `stale`: the animated portrait is re-rendered into a new texture
+every ~0.3-1 s, and the 3-frame-old published texture is no longer sampled. cover.3 (SHA-256
+`b51e1cef…`) follows the same draw slot to this frame's texture when the draw count is unchanged,
+the size and format match and the old texture is no longer sampled (`dump::ResolveCurrent`).
+
+Live, cover.3: box still visible; `swapped 0` all session, `stale` on half the coverage updates.
+The screen-space design is the problem: positions arrive 3 frames late and animated portraits
+change texture faster than that. Replaced (user decision) by texture-space portraits,
+`portrait_texture=1`, build `ck3-frontier3-tex.1` (SHA-256 `7781dfe4…`): at present the feeder
+copies every Portrait texture the frame sampled into a texture-space atlas (`src/feed_portrait_tex.h`;
+cells through `portrait::Allocate`, a re-rendered texture inherits its slot), runs NR, restores
+alpha (`(min(nr.rgb, a), a)`, transparent texels untouched) and copies each result into its own
+"shadow" texture. In the next frame `feed_render_dump.h` re-issues each GUI portrait draw with a
+copy of set 0 whose Portrait binding (0/117) is the shadow, then rebinds the game's set. The game's
+shader composites, so the map and UI are never processed. Fallbacks draw the game's texture.
+Tests: `tests/portrait-tex.cpp` (planner through the allocator; finish pass exact on WARP and
+RTX 3060). Load-screen portraits (400x1400) exceed a cell and stay native.
+
+Live, tex.1 (`build/frontier3-tex1-20261031T212111Z`): box gone (user). Hover still dropped DLSS
+for about a second: the hovered ruler portrait is re-rendered into a fresh texture of a new size
+every frame of its zoom (455..473), so no exact shadow existed in time (up to half of all portrait
+draws used the game's texture) and each size moved its atlas slot, sometimes rebuilding the
+feature. tex.2 (SHA-256 `ec1e3ac2…`): slots reserve 5% headroom and only grow; a replacement at
+the same draw position within 10% of the size inherits the slot (history reset only); a draw whose
+texture is new takes last frame's shadow for the same draw position when the Frame/Mask/Background
+views match and the size is within 10% (`g_shadow_at`, logged as "carried").
+
 1. **User decision:** switch back to DLSS5Extended (`Install CK3 DLSS 5 Extended Test.cmd`
    in the game folder, or `DLSS5-CK3.ps1 -Action Install -Profile DLSS5Extended`). Confirm
    with `.\tools\Frontier3-Live.ps1 -Action Status`: profile DLSS5Extended, portrait settings

@@ -92,6 +92,8 @@ jobs:
           Invoke-Expression ([regex]::Match($src, '(?s)function New-DefaultFeederConfig.*?\r?\n\}\r?\n').Value)
           foreach ($mode in 'DLSS5', 'DLSS5Extended', 'NativeStreamline') {
             if ((New-DefaultFeederConfig $mode) -notmatch '(?m)^portrait_mode=1') { throw "$mode default config does not enable portrait mode" }
+            # Texture-space portraits remove the rectangle around characters (Frontier 3).
+            if ((New-DefaultFeederConfig $mode) -notmatch '(?m)^portrait_texture=1') { throw "$mode default config does not enable texture-space portraits" }
           }
           'package checks passed'
 

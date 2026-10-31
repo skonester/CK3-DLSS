@@ -27,6 +27,14 @@
 //      each draw samples (PortraitUVOffset/Scale), and PNGs are written to dlss5-feed-dump\.
 //      To make that copy legal, dump mode adds copy_source to sampled 2D textures at creation.
 //   7. GetPortraits' data carries its frame of origin (PortraitAge) for frame association.
+//
+// Frontier 3 coverage (portrait_coverage=1, start-up): the texture tracking of 5 also runs without
+// render_dump, copy_source is added to sampled colour render targets (every portrait texture is
+// one), and each published rectangle carries the Portrait texture it sampled (GetPortraitSources).
+// Its alpha is the character silhouette (verified by the 2026-10-31 probe), which the feeder blits
+// into a coverage atlas. A texture counts only while this frame's draws sample that generation of
+// it (ResolveCurrent, which also follows a re-rendered portrait to its new texture): recycled
+// handles and closed windows fall back to legacy.
 
 #pragma once
 
@@ -40,6 +48,7 @@
 #include <vector>
 
 #include "feed_dump_probe.h"
+#include "feed_portrait_tex.h"   // ptex::Similar: the same portrait re-rendered at another size
 
 namespace dump
 {
@@ -79,11 +88,12 @@ static std::unordered_map<uint64_t, std::vector<ParamInfo>> g_layouts;  // pipel
 struct DescEntry { buffer_range range; descriptor_type type; };
 static std::mutex g_desc_mx;
 static std::unordered_map<uint64_t, DescEntry> g_desc;  // hash(table, binding) -> constant-buffer range
-static std::unordered_map<uint64_t, uint64_t>  g_img;   // hash(table, binding) -> texture view (render_dump=1 only)
+static std::unordered_map<uint64_t, uint64_t>  g_img;   // hash(table, binding) -> texture view (image tracking only)
+static std::unordered_map<uint64_t, uint64_t>  g_img_sampler;   // same key -> sampler of a combined image sampler
 
 static uint64_t DescKey(uint64_t table, uint32_t binding) { return table * 0x9E3779B97F4A7C15ull ^ binding; }
 
-// Texture and view lifetimes (render_dump=1 only). Descriptor handles are only resolved
+// Texture and view lifetimes (image tracking only). Descriptor handles are only resolved
 // through these maps, never by asking ReShade about a handle that may have been destroyed.
 struct ViewInfo { uint64_t resource; resource_view_desc desc; };
 static std::mutex g_res_mx;
@@ -91,6 +101,8 @@ static std::unordered_map<uint64_t, resource_desc> g_textures;   // texture -> d
 static std::unordered_map<uint64_t, ViewInfo>      g_views;      // texture view -> resource + desc
 static std::unordered_map<uint64_t, uint32_t>      g_tex_ids;    // texture -> T#id (new id after destroy)
 static uint32_t                                    g_next_tex_id = 1;
+static std::unordered_map<uint64_t, uint64_t>      g_tex_gen;    // texture -> generation (a recycled handle gets a new one)
+static uint64_t                                    g_next_gen = 1;
 static std::atomic<uint32_t> g_copy_src_added{ 0 };
 
 static constexpr int kMaxSets = 8, kMaxDyn = 16, kMaxPush = 4, kMaxPushImg = 8;
@@ -132,8 +144,11 @@ struct PortraitDraw
     uint32_t     rt_w, rt_h;
     viewport     vp;
     rect         scissor;
-    uint64_t     views[IMG_COUNT];    // render_dump=1: texture views bound at the shader's bindings
+    uint64_t     views[IMG_COUNT];    // image tracking: texture views bound at the shader's bindings
     uint32_t     tex_id[IMG_COUNT];   // render_dump=1: T#id of each view's texture (0 unknown)
+    // Portrait texture behind views[IMG_PORTRAIT], resolved at draw time (portrait_coverage=1; 0 = unknown).
+    uint64_t     src_res, src_gen;
+    uint32_t     src_w, src_h, src_level, src_layer, src_fmt;
 };
 
 static std::mutex g_frame_mx;
@@ -148,6 +163,215 @@ static std::vector<CensusEntry> g_census;   // guarded by g_frame_mx
 
 static std::atomic<uint32_t> g_pipes_seen{ 0 }, g_pipes_no_code{ 0 }, g_pipes_tagged{ 0 };
 static bool g_verbose = false;   // render_dump=1: logging, census, 3D-character stats
+static bool g_coverage = false;  // portrait_coverage=1: publish Portrait texture sources
+static bool g_track_images = false;   // g_verbose || g_coverage
+static bool g_tex_mode = false;  // portrait_texture=1: GUI portrait draws sample the feeder's enhanced copies
+
+// ---------------------------------------------------------------------------
+// Texture-space portraits (portrait_texture=1). The feeder enhances each Portrait texture a frame
+// samples and keeps the result in a texture of its own (a "shadow"), written at that frame's
+// present. In the next frame every GUI portrait draw of that texture is re-issued with a copy of
+// its descriptor set whose Portrait binding points at the shadow, then the game's set is bound
+// again. The game's shader still does all compositing (alpha, mask, frame, highlight, clipping),
+// so nothing outside the character is ever changed. A shadow is used only in the frame right
+// after it was written; anything else draws the game's own texture.
+// ---------------------------------------------------------------------------
+
+struct ShadowRef { uint64_t gen, view, ready_frame; };
+// A hovered portrait is re-rendered into a fresh texture of a new size every frame of its zoom, so
+// its exact shadow never exists in time. Such a draw takes the shadow written last frame for the
+// same draw position, if the widget is the same (Frame, Mask and Background views) and the texture
+// is within ptex::Similar of that shadow's: the same portrait, one frame behind like every shadow.
+// The GUI shader samples in 0..1 UV, so the few-pixel size difference does not misplace it.
+struct PositionShadow { uint64_t view, ready_frame, widget[3]; uint32_t w, h; };
+struct RedirectSet { device *dev; uint64_t game_table, layout, view, table; uint32_t set; };
+struct RetiredSet { device *dev; uint64_t table, frame; };
+static std::mutex g_redir_mx;
+static std::unordered_map<uint64_t, ShadowRef> g_shadows;   // Portrait texture -> shadow
+static std::unordered_map<uint32_t, PositionShadow> g_shadow_at;   // draw position -> shadow
+static std::vector<RedirectSet> g_redirect_sets;            // our descriptor sets, by (game set, shadow view)
+static std::vector<RetiredSet>  g_retired_sets;             // freed once no frame in flight can use them
+static std::atomic<uint64_t> g_redirected{ 0 }, g_redirect_carried{ 0 }, g_redirect_missed{ 0 };
+static thread_local bool t_reissuing = false;
+static constexpr uint64_t kRetireFrames = 8;
+
+// A set copied from game_table (0 = any) or pointing at view (0 = any) is stale: retire it.
+static void RetireRedirects(uint64_t game_table, uint64_t view)
+{
+    std::lock_guard<std::mutex> lock(g_redir_mx);
+    if (g_redirect_sets.empty()) return;
+    const uint64_t now = g_frame.load();
+    for (size_t i = 0; i < g_redirect_sets.size();)
+    {
+        const RedirectSet &r = g_redirect_sets[i];
+        if ((game_table != 0 && r.game_table == game_table) || (view != 0 && r.view == view))
+        {
+            g_retired_sets.push_back({ r.dev, r.table, now });
+            g_redirect_sets[i] = g_redirect_sets.back();
+            g_redirect_sets.pop_back();
+        }
+        else ++i;
+    }
+}
+
+// Feeder side: the shadow of (res, gen) now holds this frame's enhanced portrait. index and first
+// describe the texture's first portrait draw this frame (for the zoom fallback).
+static void SetShadow(uint64_t res, uint64_t gen, uint64_t view, uint32_t index, const PortraitDraw *first)
+{
+    std::lock_guard<std::mutex> lock(g_redir_mx);
+    const uint64_t now = g_frame.load();
+    g_shadows[res] = { gen, view, now };
+    if (first != nullptr)
+        g_shadow_at[index] = { view, now, { first->views[dprobe::IMG_FRAME], first->views[IMG_MASK], first->views[dprobe::IMG_BACKGROUND] },
+                               first->src_w, first->src_h };
+}
+
+// Feeder side: the shadow view is about to be destroyed (after kRetireFrames).
+static void DropShadow(uint64_t res, uint64_t view)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_redir_mx);
+        const auto it = g_shadows.find(res);
+        if (it != g_shadows.end() && it->second.view == view) g_shadows.erase(it);
+        for (auto p = g_shadow_at.begin(); p != g_shadow_at.end();)
+            p = p->second.view == view ? g_shadow_at.erase(p) : std::next(p);
+    }
+    RetireRedirects(0, view);
+}
+
+static void FreeRetiredSets(device *only, bool all)
+{
+    std::vector<RetiredSet> ready;
+    {
+        std::lock_guard<std::mutex> lock(g_redir_mx);
+        const uint64_t now = g_frame.load();
+        for (size_t i = 0; i < g_retired_sets.size();)
+        {
+            const RetiredSet &r = g_retired_sets[i];
+            if ((only == nullptr || r.dev == only) && (all || now - r.frame >= kRetireFrames))
+            {
+                ready.push_back(r);
+                g_retired_sets[i] = g_retired_sets.back();
+                g_retired_sets.pop_back();
+            }
+            else ++i;
+        }
+        if (all)
+            for (size_t i = 0; i < g_redirect_sets.size();)
+                if (only == nullptr || g_redirect_sets[i].dev == only)
+                {
+                    ready.push_back({ g_redirect_sets[i].dev, g_redirect_sets[i].table, now });
+                    g_redirect_sets[i] = g_redirect_sets.back();
+                    g_redirect_sets.pop_back();
+                }
+                else ++i;
+    }
+    for (const RetiredSet &r : ready)
+    {
+        const descriptor_table t = { r.table };
+        r.dev->free_descriptor_tables(1, &t);
+    }
+}
+
+// Our copy of the game's set with the Portrait binding replaced by the shadow view (cached).
+static uint64_t RedirectTable(device *dev, uint64_t layout, uint32_t set, uint64_t game_table, uint32_t binding, uint64_t view)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_redir_mx);
+        for (const RedirectSet &r : g_redirect_sets)
+            if (r.dev == dev && r.game_table == game_table && r.layout == layout && r.set == set && r.view == view) return r.table;
+    }
+    std::vector<RangeInfo> ranges;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_pipe_mx);
+        const auto it = g_layouts.find(layout);
+        if (it == g_layouts.end() || set >= it->second.size()) return 0;
+        ranges = it->second[set].ranges;
+    }
+    descriptor_type type = descriptor_type::sampler;
+    bool found = false;
+    for (const RangeInfo &r : ranges)
+    {
+        if (r.count == 0 || r.count > 4096) return 0;   // unbounded/bindless arrays: not copied
+        if (binding >= r.binding && binding - r.binding < r.count) { type = r.type; found = true; }
+    }
+    if (!found || (type != descriptor_type::sampler_with_resource_view && type != descriptor_type::shader_resource_view)) return 0;
+    uint64_t sampler = 0;
+    if (type == descriptor_type::sampler_with_resource_view)
+    {
+        std::lock_guard<std::mutex> lock(g_desc_mx);
+        const auto it = g_img_sampler.find(DescKey(game_table, binding));
+        if (it == g_img_sampler.end()) return 0;
+        sampler = it->second;
+    }
+    descriptor_table table = { 0 };
+    if (!dev->allocate_descriptor_tables(1, pipeline_layout{ layout }, set, &table) || table.handle == 0)
+    {
+        static bool said = false;
+        if (!said) Log("[dump] texture-space portraits: descriptor set allocation failed; portraits drawn from the game's texture");
+        said = true;
+        return 0;
+    }
+    std::vector<descriptor_table_copy> copies;
+    for (const RangeInfo &r : ranges)
+    {
+        descriptor_table_copy c = {};
+        c.source_table = descriptor_table{ game_table }; c.source_binding = r.binding;
+        c.dest_table = table; c.dest_binding = r.binding; c.count = r.count;
+        copies.push_back(c);
+    }
+    dev->copy_descriptor_tables(static_cast<uint32_t>(copies.size()), copies.data());
+    sampler_with_resource_view combined = { reshade::api::sampler{ sampler }, resource_view{ view } };
+    resource_view plain = { view };
+    descriptor_table_update u = {};
+    u.table = table; u.binding = binding; u.count = 1; u.type = type;
+    u.descriptors = type == descriptor_type::sampler_with_resource_view ? static_cast<const void *>(&combined) : &plain;
+    dev->update_descriptor_tables(1, &u);
+    std::lock_guard<std::mutex> lock(g_redir_mx);
+    g_redirect_sets.push_back({ dev, game_table, layout, view, table.handle, set });
+    return table.handle;
+}
+
+// Re-issue a GUI portrait draw against the shadow of its Portrait texture. True = done (skip the
+// game's own draw); false = draw normally.
+// d: this draw's resolved views and Portrait source; index: its position among the frame's portrait draws (-1 unknown).
+template <class Issue>
+static bool Redirect(command_list *cl, const CmdState *s, const PortraitDraw &d, int index, const Issue &issue)
+{
+    const dprobe::ImgBinding &img = s->cb.img[IMG_PORTRAIT];
+    if (!img.found || img.set >= kMaxSets || s->tables[img.set] == 0) return false;
+    for (uint32_t i = 0; i < s->push_img_count; ++i)
+        if (s->push_img[i].set == img.set && s->push_img[i].binding == img.binding) return false;   // push descriptor: not handled
+    uint64_t view = 0;
+    bool carried = false;
+    {
+        std::lock_guard<std::mutex> lock(g_redir_mx);
+        const uint64_t now = g_frame.load();
+        const auto it = g_shadows.find(d.src_res);
+        if (it != g_shadows.end() && it->second.gen == d.src_gen && it->second.ready_frame + 1 == now) view = it->second.view;
+        else if (index >= 0)
+        {
+            const auto at = g_shadow_at.find(static_cast<uint32_t>(index));
+            if (at != g_shadow_at.end() && at->second.ready_frame + 1 == now && d.views[IMG_MASK] != 0 &&
+                at->second.widget[0] == d.views[dprobe::IMG_FRAME] && at->second.widget[1] == d.views[IMG_MASK] &&
+                at->second.widget[2] == d.views[dprobe::IMG_BACKGROUND] &&
+                ptex::Similar(at->second.w, at->second.h, d.src_w, d.src_h))
+            { view = at->second.view; carried = true; }
+        }
+    }
+    if (view == 0) { ++g_redirect_missed; return false; }
+    const uint64_t layout = s->set_layout[img.set], game_table = s->tables[img.set];
+    const uint64_t table = RedirectTable(cl->get_device(), layout, img.set, game_table, img.binding, view);
+    if (table == 0) { ++g_redirect_missed; return false; }
+    const descriptor_table ours = { table }, game = { game_table };
+    cl->bind_descriptor_tables2(shader_stage::all_graphics, pipeline_layout{ layout }, img.set, 1, &ours, s->dyn_count[img.set], s->dyn[img.set]);
+    t_reissuing = true;
+    issue();
+    t_reissuing = false;
+    cl->bind_descriptor_tables2(shader_stage::all_graphics, pipeline_layout{ layout }, img.set, 1, &game, s->dyn_count[img.set], s->dyn[img.set]);
+    ++(carried ? g_redirect_carried : g_redirected);
+    return true;
+}
 
 // Published portrait rectangles (screen pixels, unclipped), decoded kSlots-1 frames after the draw.
 struct PRect { int x, y, w, h; };
@@ -156,12 +380,53 @@ static std::vector<PRect> g_pub;
 static uint32_t           g_pub_stable = 0;   // consecutive decodes with an unchanged set
 static uint64_t           g_pub_frame = 0;    // frame the published draws were recorded in
 
+// The Portrait texture a published widget sampled, with its UV transform. gui_portrait.shader and
+// gui_painterly_portrait.shader sample at (UV1 - PortraitUVOffset) / PortraitUVScale, UV1 being
+// the 0..1 position across the widget.
+struct PSource
+{
+    PRect    widget;
+    float    uv_off[2], uv_scale[2];
+    uint64_t res, gen;
+    uint32_t tex_w, tex_h, level, layer, fmt;
+    uint32_t draw_index, draw_count;   // position among that frame's portrait draws
+};
+static std::vector<PSource> g_pub_src;   // guarded by g_pub_mx
+
 // Copy of the latest portrait rectangles; returns how many decodes in a row they have been stable.
 static uint32_t GetPortraits(std::vector<PRect> &out)
 {
     std::lock_guard<std::mutex> lock(g_pub_mx);
     out = g_pub;
     return g_pub_stable;
+}
+
+// Texture sources of the same decode as GetPortraits (portrait_coverage=1; may be fewer).
+static void GetPortraitSources(std::vector<PSource> &out)
+{
+    std::lock_guard<std::mutex> lock(g_pub_mx);
+    out = g_pub_src;
+}
+
+// Point a published source at a texture the frame now being presented samples: it then still
+// exists, is in shader-read state, and holds this frame's content. 0 = unusable, 1 = as published,
+// 2 = swapped. Animated portraits are re-rendered into a new texture every few hundred ms, so the
+// published (kSlots-1 frames old) texture is often gone; the same draw slot of this frame is taken
+// instead, but only if the draw list kept its length, the slot's texture has the published size and
+// format, and nothing still samples the old texture (a reorder would) -- never another portrait's.
+static int ResolveCurrent(PSource &p)
+{
+    std::lock_guard<std::mutex> lock(g_frame_mx);
+    const auto samples = [&](uint64_t res, uint64_t gen) {
+        return std::any_of(g_frame_draws.begin(), g_frame_draws.end(),
+                           [&](const PortraitDraw &d) { return d.src_res == res && d.src_gen == gen; });
+    };
+    if (samples(p.res, p.gen)) return 1;
+    if (g_frame_draws.size() != p.draw_count || p.draw_index >= g_frame_draws.size()) return 0;
+    const PortraitDraw &d = g_frame_draws[p.draw_index];
+    if (d.src_res == 0 || d.src_w != p.tex_w || d.src_h != p.tex_h || d.src_fmt != p.fmt) return 0;
+    p.res = d.src_res; p.gen = d.src_gen; p.level = d.src_level; p.layer = d.src_layer;
+    return 2;
 }
 
 // Frames between the draws behind GetPortraits' rectangles and now; -1 before the first decode.
@@ -221,9 +486,11 @@ static bool OnCreateResource(device *dev, resource_desc &desc, subresource_data 
         desc.usage |= resource_usage::copy_source;
         return true;
     }
-    // Dump mode only: sampled 2D textures get TRANSFER_SRC so the census probe may copy one.
+    // Dump mode: sampled 2D textures get TRANSFER_SRC so the census probe may copy one. Coverage
+    // mode: only sampled colour render targets (portraits are rendered, never uploaded).
     // Never transient/depth/multisampled images (they never carry shader_resource here anyway).
-    if (g_verbose && desc.type == resource_type::texture_2d && (desc.usage & resource_usage::shader_resource) != 0 &&
+    if ((g_verbose || (g_coverage && (desc.usage & resource_usage::render_target) != 0)) &&
+        desc.type == resource_type::texture_2d && (desc.usage & resource_usage::shader_resource) != 0 &&
         (desc.usage & resource_usage::depth_stencil) == 0 && (desc.usage & resource_usage::copy_source) == 0 &&
         desc.texture.samples <= 1)
     {
@@ -240,6 +507,7 @@ static void OnInitResource(device *dev, const resource_desc &desc, const subreso
     std::lock_guard<std::mutex> lock(g_res_mx);
     g_textures[res.handle] = desc;
     g_tex_ids.erase(res.handle);   // a recycled handle is a new texture
+    g_tex_gen[res.handle] = g_next_gen++;
 }
 
 static void OnDestroyResource(device *, resource res)
@@ -247,6 +515,7 @@ static void OnDestroyResource(device *, resource res)
     std::lock_guard<std::mutex> lock(g_res_mx);
     g_textures.erase(res.handle);
     g_tex_ids.erase(res.handle);
+    g_tex_gen.erase(res.handle);
 }
 
 static void OnInitResourceView(device *dev, resource res, resource_usage, const resource_view_desc &desc, resource_view view)
@@ -392,14 +661,22 @@ static bool OnUpdateDescriptorTables(device *, uint32_t count, const descriptor_
             for (uint32_t k = 0; k < u.count; ++k)
                 g_desc[DescKey(u.table.handle, u.binding + u.array_offset + k)] = { r[k], u.type };
         }
-        else if (g_verbose && (u.type == descriptor_type::sampler_with_resource_view || u.type == descriptor_type::shader_resource_view))
+        else if (g_track_images && (u.type == descriptor_type::sampler_with_resource_view || u.type == descriptor_type::shader_resource_view))
         {
             for (uint32_t k = 0; k < u.count; ++k)
-                g_img[DescKey(u.table.handle, u.binding + u.array_offset + k)] = ImageViewOf(u, k);
+            {
+                const uint64_t key = DescKey(u.table.handle, u.binding + u.array_offset + k);
+                g_img[key] = ImageViewOf(u, k);
+                if (u.type == descriptor_type::sampler_with_resource_view)
+                    g_img_sampler[key] = static_cast<const sampler_with_resource_view *>(u.descriptors)[k].sampler.handle;
+            }
         }
     }
     if (g_desc.size() > (1u << 20)) g_desc.clear();   // handles are recycled; never grow unbounded
     if (g_img.size() > (1u << 20)) g_img.clear();
+    if (g_img_sampler.size() > (1u << 20)) g_img_sampler.clear();
+    if (g_tex_mode)
+        for (uint32_t i = 0; i < count; ++i) RetireRedirects(updates[i].table.handle, 0);
     return false;
 }
 
@@ -413,12 +690,16 @@ static bool OnCopyDescriptorTables(device *, uint32_t count, const descriptor_ta
             const uint64_t dst = DescKey(copies[i].dest_table.handle, copies[i].dest_binding + copies[i].dest_array_offset + k);
             const auto it = g_desc.find(src);
             if (it != g_desc.end()) g_desc[dst] = it->second;
-            if (g_verbose)
+            if (g_track_images)
             {
                 const auto im = g_img.find(src);
                 if (im != g_img.end()) g_img[dst] = im->second;
+                const auto sm = g_img_sampler.find(src);
+                if (sm != g_img_sampler.end()) g_img_sampler[dst] = sm->second;
             }
         }
+    if (g_tex_mode)
+        for (uint32_t i = 0; i < count; ++i) RetireRedirects(copies[i].dest_table.handle, 0);
     return false;
 }
 
@@ -469,7 +750,7 @@ static void OnBindDescriptorTables(command_list *cl, shader_stage, pipeline_layo
 static void OnPushDescriptors(command_list *cl, shader_stage, pipeline_layout, uint32_t param, const descriptor_table_update &u)
 {
     if (u.descriptors == nullptr) return;
-    if (g_verbose && (u.type == descriptor_type::sampler_with_resource_view || u.type == descriptor_type::shader_resource_view))
+    if (g_track_images && (u.type == descriptor_type::sampler_with_resource_view || u.type == descriptor_type::shader_resource_view))
     {
         CmdState *s = State(cl);
         for (uint32_t k = 0; k < u.count; ++k)
@@ -566,15 +847,38 @@ static uint64_t ResolveImage(const CmdState *s, uint32_t set, uint32_t binding)
     return it != g_img.end() ? it->second : 0;
 }
 
-static void RecordPortrait(CmdState *s)
+// The Portrait texture behind d.views[IMG_PORTRAIT]: resource, generation, sampled mip/layer.
+static void FillSource(PortraitDraw &d)
+{
+    if (d.views[IMG_PORTRAIT] == 0) return;
+    std::lock_guard<std::mutex> lock(g_res_mx);
+    const auto v = g_views.find(d.views[IMG_PORTRAIT]);
+    if (v == g_views.end()) return;
+    const auto t = g_textures.find(v->second.resource);
+    const auto gen = g_tex_gen.find(v->second.resource);
+    if (t == g_textures.end() || gen == g_tex_gen.end() || (t->second.usage & resource_usage::copy_source) == 0) return;
+    const resource_desc &rd = t->second;
+    const uint32_t levels = (std::max)(1u, static_cast<uint32_t>(rd.texture.levels));
+    const uint32_t level = (std::min)(v->second.desc.texture.first_level, levels - 1);
+    const uint32_t layer = v->second.desc.texture.first_layer < rd.texture.depth_or_layers ? v->second.desc.texture.first_layer : 0;
+    d.src_res = v->second.resource;
+    d.src_gen = gen->second;
+    d.src_w = (std::max)(1u, rd.texture.width >> level);
+    d.src_h = (std::max)(1u, rd.texture.height >> level);
+    d.src_level = level;
+    d.src_layer = layer;
+    d.src_fmt = static_cast<uint32_t>(rd.texture.format);
+}
+
+static int RecordPortrait(CmdState *s)
 {
     PortraitDraw d = {};
     d.rt_w = s->rt_w; d.rt_h = s->rt_h; d.vp = s->vp; d.scissor = s->scissor;
     const CbInfo &cb = s->cb;
-    if (!cb.found) return;
+    if (!cb.found) return -1;
     if (cb.push_constant)
     {
-        if (!s->push_constants_valid) return;
+        if (!s->push_constants_valid) return -1;
         memcpy(d.bytes, s->push_constants, sizeof(d.bytes));
         d.cpu_bytes = true;
         d.source = 2;
@@ -590,7 +894,7 @@ static void RecordPortrait(CmdState *s)
             {
                 std::lock_guard<std::mutex> lock(g_desc_mx);
                 const auto it = g_desc.find(DescKey(s->tables[cb.set], cb.binding));
-                if (it == g_desc.end()) return;
+                if (it == g_desc.end()) return -1;
                 e = it->second;
             }
             d.range = e.range;
@@ -613,20 +917,24 @@ static void RecordPortrait(CmdState *s)
             }
             have = true;
         }
-        if (!have) return;
+        if (!have) return -1;
     }
-    if (g_verbose)
+    if (g_track_images)
         for (int k = 0; k < IMG_COUNT; ++k)
             if (cb.img[k].found) d.views[k] = ResolveImage(s, cb.img[k].set, cb.img[k].binding);
+    if (g_coverage) FillSource(d);
     std::lock_guard<std::mutex> lock(g_frame_mx);
     g_last_cb = cb;
-    if (g_frame_draws.size() < kMaxPerFrame) g_frame_draws.push_back(d);
+    if (g_frame_draws.size() >= kMaxPerFrame) return -1;
+    g_frame_draws.push_back(d);
+    return static_cast<int>(g_frame_draws.size() - 1);
 }
 
-static void OnAnyDraw(command_list *cl)
+// Returns the draw's position among this frame's portrait draws (-1: not a recorded portrait draw).
+static int OnAnyDraw(command_list *cl)
 {
     CmdState *s = cl->get_private_data<CmdState>();
-    if (s == nullptr) return;
+    if (s == nullptr) return -1;
     if (s->census_entry >= 0)
     {
         std::lock_guard<std::mutex> lock(g_frame_mx);
@@ -638,8 +946,8 @@ static void OnAnyDraw(command_list *cl)
             if (s->tag == TAG_CHAR3D) ++e.char3d;
         }
     }
-    if (s->tag == TAG_GUI_PORTRAIT) RecordPortrait(s);
-    else if (s->tag == TAG_CHAR3D && g_verbose)
+    if (s->tag == TAG_GUI_PORTRAIT) return RecordPortrait(s);
+    if (s->tag == TAG_CHAR3D && g_verbose)
     {
         std::lock_guard<std::mutex> lock(g_frame_mx);
         ++g_frame_char3d;
@@ -648,28 +956,79 @@ static void OnAnyDraw(command_list *cl)
             std::find(g_frame_char3d_rts.begin(), g_frame_char3d_rts.end(), key) == g_frame_char3d_rts.end())
             g_frame_char3d_rts.push_back(key);
     }
+    return -1;
 }
 
-static bool OnDraw(command_list *cl, uint32_t, uint32_t, uint32_t, uint32_t) { OnAnyDraw(cl); return false; }
-static bool OnDrawIndexed(command_list *cl, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { OnAnyDraw(cl); return false; }
-static bool OnDrawIndirect(command_list *cl, indirect_command, resource, uint64_t, uint32_t, uint32_t) { OnAnyDraw(cl); return false; }
+// portrait_texture=1: re-issue this GUI portrait draw against the shadow of its Portrait texture.
+template <class Issue>
+static bool TryRedirect(command_list *cl, int index, const Issue &issue)
+{
+    if (!g_tex_mode) return false;
+    const CmdState *s = cl->get_private_data<CmdState>();
+    if (s == nullptr || s->tag != TAG_GUI_PORTRAIT || !s->cb.img[IMG_PORTRAIT].found) return false;
+    PortraitDraw d = {};
+    for (int k = 0; k < IMG_COUNT; ++k)
+        if (s->cb.img[k].found) d.views[k] = ResolveImage(s, s->cb.img[k].set, s->cb.img[k].binding);
+    FillSource(d);
+    return d.src_res != 0 && Redirect(cl, s, d, index, issue);
+}
+
+static bool OnDraw(command_list *cl, uint32_t vertices, uint32_t instances, uint32_t first_vertex, uint32_t first_instance)
+{
+    if (t_reissuing) return false;
+    const int index = OnAnyDraw(cl);
+    return TryRedirect(cl, index, [&] { cl->draw(vertices, instances, first_vertex, first_instance); });
+}
+static bool OnDrawIndexed(command_list *cl, uint32_t indices, uint32_t instances, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+{
+    if (t_reissuing) return false;
+    const int index = OnAnyDraw(cl);
+    return TryRedirect(cl, index, [&] { cl->draw_indexed(indices, instances, first_index, vertex_offset, first_instance); });
+}
+static bool OnDrawIndirect(command_list *cl, indirect_command, resource, uint64_t, uint32_t, uint32_t)
+{
+    if (t_reissuing) return false;
+    OnAnyDraw(cl);
+    return false;   // indirect portrait draws keep the game's texture
+}
 
 static void OnDestroyCommandList(command_list *cl)
 {
     if (cl->get_private_data<CmdState>() != nullptr) cl->destroy_private_data<CmdState>();
 }
 
+// The portrait draws recorded so far for the frame now being presented (texture sources filled in
+// with portrait_coverage=1 or portrait_texture=1). Call before this frame's reshade_present.
+static void CurrentFrameDraws(std::vector<PortraitDraw> &out)
+{
+    std::lock_guard<std::mutex> lock(g_frame_mx);
+    out = g_frame_draws;
+}
+
 static void OnDestroyDevice(device *dev)
 {
+    if (g_tex_mode)
+    {
+        FreeRetiredSets(dev, true);
+        std::lock_guard<std::mutex> lock(g_redir_mx);
+        g_shadows.clear();
+    }
     if (dev == g_rb_dev && g_rb.handle != 0) { dev->destroy_resource(g_rb); g_rb = { 0 }; g_rb_dev = nullptr; }
     if (dev == g_probe.dev && g_probe.buf.handle != 0) { dev->destroy_resource(g_probe.buf); g_probe = Probe(); }
 }
 
 static float F(const uint8_t *b, uint32_t off) { float v = 0; if (off + 4 <= 64) memcpy(&v, b + off, 4); return v; }
 
+// A UV transform the coverage blit can follow: finite, non-degenerate scale.
+static bool UvUsable(float off, float scale)
+{
+    return off > -64.0f && off < 64.0f && fabsf(scale) > 1e-4f && fabsf(scale) < 64.0f;   // also rejects NaN
+}
+
 static void Publish(const uint8_t *base, const std::vector<PortraitDraw> &meta, const CbInfo &cb, uint64_t frame)
 {
     std::vector<PRect> rects;
+    std::vector<PSource> sources;
     for (size_t i = 0; i < meta.size(); ++i)
     {
         const uint8_t *b = meta[i].cpu_bytes ? meta[i].bytes : base + i * kStride;
@@ -677,10 +1036,17 @@ static void Publish(const uint8_t *base, const std::vector<PortraitDraw> &meta, 
         const float x = F(b, cb.off_pos), y = F(b, cb.off_pos + 4), w = F(b, cb.off_size), h = F(b, cb.off_size + 4);
         if (!(w >= 1.0f && h >= 1.0f && w <= 8192.0f && h <= 8192.0f && x > -8192.0f && x < 8192.0f && y > -8192.0f && y < 8192.0f))
             continue;   // also rejects NaN
-        rects.push_back({ static_cast<int>(lroundf(x)), static_cast<int>(lroundf(y)),
-                          static_cast<int>(lroundf(w)), static_cast<int>(lroundf(h)) });
+        const PRect r = { static_cast<int>(lroundf(x)), static_cast<int>(lroundf(y)),
+                          static_cast<int>(lroundf(w)), static_cast<int>(lroundf(h)) };
+        rects.push_back(r);
+        const PortraitDraw &d = meta[i];
+        const float ox = F(b, cb.off_uvoff), oy = F(b, cb.off_uvoff + 4), sx = F(b, cb.off_uvscale), sy = F(b, cb.off_uvscale + 4);
+        if (g_coverage && d.src_res != 0 && UvUsable(ox, sx) && UvUsable(oy, sy))
+            sources.push_back({ r, { ox, oy }, { sx, sy }, d.src_res, d.src_gen, d.src_w, d.src_h, d.src_level, d.src_layer, d.src_fmt,
+                                static_cast<uint32_t>(i), static_cast<uint32_t>(meta.size()) });
     }
     std::lock_guard<std::mutex> lock(g_pub_mx);
+    g_pub_src.swap(sources);
     bool same = rects.size() == g_pub.size();
     for (size_t i = 0; same && i < rects.size(); ++i)
         same = abs(rects[i].x - g_pub[i].x) <= 1 && abs(rects[i].y - g_pub[i].y) <= 1 &&
@@ -922,6 +1288,19 @@ static void OnPresent(effect_runtime *rt)
     if (g_rb_dev != nullptr && g_rb_dev != rt->get_device()) { g_rb = { 0 }; g_rb_dev = nullptr; }
 
     const uint64_t frame = g_frame.fetch_add(1) + 1;   // draws recorded from now on belong to `frame`
+    if (g_tex_mode)
+    {
+        FreeRetiredSets(nullptr, false);
+        static uint64_t last_redirected = 0, last_carried = 0, last_missed = 0;
+        if (frame % 1800 == 0)
+        {
+            const uint64_t r = g_redirected.load(), c = g_redirect_carried.load(), m = g_redirect_missed.load();
+            Log("[dump] texture-space portraits: %llu draws from enhanced textures (%llu carried across a re-render), %llu from the game's (last 1800 frames)",
+                static_cast<unsigned long long>(r - last_redirected + c - last_carried), static_cast<unsigned long long>(c - last_carried),
+                static_cast<unsigned long long>(m - last_missed));
+            last_redirected = r; last_carried = c; last_missed = m;
+        }
+    }
 
     // Census hotkey: Ctrl+Shift+F11 arms the next frame.
     static bool key_down = false;
@@ -1048,15 +1427,22 @@ static void OnPresent(effect_runtime *rt)
     }
 }
 
-static void Register(bool verbose)
+static void Register(bool verbose, bool coverage, bool tex_mode)
 {
     g_verbose = verbose;
+    g_tex_mode = tex_mode;
+    g_coverage = coverage || tex_mode;   // texture mode needs the same texture tracking and copy_source
+    g_track_images = verbose || g_coverage;
     if (verbose)
         Log("[dump] render dumper ON (render_dump=1): tagging GUI-portrait + 3D-character pipelines; Ctrl+Shift+F11 = one-frame census + portrait texture probe");
     else
         Log("[dump] portrait detection ON (portrait_mode=1)");
+    if (tex_mode)
+        Log("[dump] texture-space portraits ON (portrait_texture=1): Portrait textures enhanced in place of screen crops; GUI draws re-issued with the enhanced copies");
+    else if (coverage)
+        Log("[dump] portrait coverage ON (portrait_coverage=1): Portrait textures tracked, copy_source added to sampled colour render targets");
     reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
-    if (verbose)
+    if (g_track_images)
     {
         reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
         reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
@@ -1088,7 +1474,7 @@ static void Register(bool verbose)
 static void Unregister()
 {
     reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
-    if (g_verbose)
+    if (g_track_images)
     {
         reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
         reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);

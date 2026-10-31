@@ -49,7 +49,7 @@
 #include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "ck3-frontier3-diag.1"
+#define FEED_VERSION "ck3-frontier3-tex.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -262,9 +262,13 @@ struct Cfg
     int   portrait_feather; // px: each portrait block grows by this much and NR fades in over it (0 = hard edge)
     int   portrait_budget;  // max atlas pixels in thousands (NR cost is ~linear in pixels; 400 ~ 11 ms on an RTX 3060)
     int   frame_stats;      // 1 = time every game present into dlss5-feed-frames.csv (Frontier 3 baseline; live)
+    int   portrait_coverage; // 1 = NR only on the character inside each portrait block, from the game's portrait alpha (start-up)
+    int   portrait_texture;  // 1 = NR on the Portrait textures themselves; the game composites them (start-up, overrides screen crops)
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f, 1, 0, 0, 48, 16, 400, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f, 1, 0, 0, 48, 16, 400, 0, 0, 0 };
+static bool g_portrait_cover = false;   // portrait_coverage=1 with portrait_mode=1 at start-up (texture usage is set at creation)
+static bool g_portrait_tex = false;     // portrait_texture=1 with portrait_mode=1 at start-up
 
 static void CfgPath(char *out)
 {
@@ -294,11 +298,12 @@ static void CfgWriteDefault()
             "preset=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\nvk_present_sync=%d\nrender_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\n"
-            "frame_stats=%d\n",
+            "frame_stats=%d\nportrait_coverage=%d\nportrait_texture=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync, g_cfg.render_dump, g_cfg.portrait_mode,
-            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats);
+            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats, g_cfg.portrait_coverage,
+            g_cfg.portrait_texture);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -339,6 +344,8 @@ static bool CfgReload()
         else if (_stricmp(key, "portrait_feather") == 0) next.portrait_feather = iv < 0 ? 0 : iv > 64 ? 64 : iv;
         else if (_stricmp(key, "portrait_budget") == 0) next.portrait_budget = iv < 50 ? 50 : iv;
         else if (_stricmp(key, "frame_stats")    == 0) next.frame_stats    = iv != 0;
+        else if (_stricmp(key, "portrait_coverage") == 0) next.portrait_coverage = iv != 0;
+        else if (_stricmp(key, "portrait_texture") == 0) next.portrait_texture = iv != 0;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -368,11 +375,13 @@ static void CfgSave()
     fprintf(f,
             "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nvk_present_sync=%d\n"
-            "render_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\nframe_stats=%d\n",
+            "render_dump=%d\nportrait_mode=%d\nportrait_min=%d\nportrait_feather=%d\nportrait_budget=%d\nframe_stats=%d\n"
+            "portrait_coverage=%d\nportrait_texture=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync, g_cfg.render_dump, g_cfg.portrait_mode,
-            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats);
+            g_cfg.portrait_min, g_cfg.portrait_feather, g_cfg.portrait_budget, g_cfg.frame_stats, g_cfg.portrait_coverage,
+            g_cfg.portrait_texture);
     fclose(f);
 }
 
@@ -383,8 +392,11 @@ static void CfgSave()
 // SLOT_MASK: the shader's DLSS5_Mask (R8, 1 = the motion vector there failed validation), handed
 // to DLSS as its "bias current colour" mask so it favours the current frame instead of warping
 // history in. Optional: an older DLSS5_Feed.fx without it simply means no mask is passed.
-enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_MASK, SLOT_COUNT };
-static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV", "Mask" };
+// SLOT_COVER: Frontier 3 character coverage (RGBA8, alpha = the game's portrait alpha blitted into
+// each block). Never handed to NGX; only the portrait blend reads it. Vulkan portrait mode with
+// portrait_coverage=1 only; null everywhere else.
+enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_MASK, SLOT_COVER, SLOT_COUNT };
+static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV", "Mask", "Cover" };
 
 static const char *kEffectFile     = "DLSS5_Feed.fx";
 static const char *kTechnique      = "DLSS5_Feed";
@@ -970,6 +982,8 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 
 static void PortraitBlendReleaseTargets();   // feed_portrait_blend.h
 static void PortraitBlendRelease();
+static void PortraitTexReleaseTargets();     // feed_portrait_tex.h
+static void PortraitTexRelease();
 
 static void ReleaseFrameResources()
 {
@@ -990,6 +1004,7 @@ static void ReleaseFrameResources()
         if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
     g.vk_layout_init = false;
     PortraitBlendReleaseTargets();
+    PortraitTexReleaseTargets();
     SafeRelease(g.output_srv);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
@@ -1409,6 +1424,7 @@ static void ShutdownSession()
     for (int i = 0; i < Feed::kFrames; ++i) SafeRelease(g.alloc[i]);
     MvProbeShutdown();
     PortraitBlendRelease();
+    PortraitTexRelease();
     SafeRelease(g.queue);
     SafeRelease(g.dev12);
     g.session_ready = false;
@@ -1859,6 +1875,10 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         ReleaseFrameResources();
         return false;
     }
+    // Optional: without it every block keeps the legacy edge feather.
+    if (g_portrait_cover && g_cfg.portrait_mode &&
+        !MakeSharedTexVk(SLOT_COVER, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, false, copy_rw, reshade::api::resource_usage::copy_dest))
+        Log("[feed] coverage atlas unavailable; portraits keep the edge feather");
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; g.reset_why |= 1u << 8; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
@@ -2246,6 +2266,409 @@ static bool BuildPortraitAtlas(const std::vector<dump::PRect> &in, UINT sw, UINT
         { g_cfg.portrait_min, g_cfg.portrait_feather, uint64_t(g_cfg.portrait_budget) * 1000 }, previous, out);
 }
 
+#include "feed_portrait_cover.h"  // Frontier 3: coverage atlas planning
+
+// Colour formats vkCmdBlitImage can read into the RGBA8 coverage atlas with alpha intact.
+static bool CoverageBlittable(reshade::api::format f)
+{
+    using reshade::api::format;
+    return f == format::r8g8b8a8_unorm || f == format::r8g8b8a8_unorm_srgb || f == format::r8g8b8a8_typeless ||
+           f == format::b8g8r8a8_unorm || f == format::b8g8r8a8_unorm_srgb || f == format::b8g8r8a8_typeless ||
+           f == format::r16g16b16a16_float || f == format::r16g16b16a16_typeless || f == format::r10g10b10a2_unorm;
+}
+
+// Frontier 3: blit each block's portrait alpha into the (cleared) coverage atlas. Returns the
+// blocks whose coverage is exact and current; every other block keeps the legacy edge feather.
+// The Portrait textures were sampled by this frame's GUI pass, so they are in shader-read state.
+static uint32_t RecordCoverageVk(reshade::api::command_list *cl, VkCommandBuffer cb, const std::vector<dump::PRect> &rects,
+                                 UINT sw, UINT sh)
+{
+    using namespace reshade::api;
+    std::vector<dump::PSource> published;
+    dump::GetPortraitSources(published);
+    std::vector<pcover::Widget> widgets;
+    for (const dump::PRect &r : rects) widgets.push_back({ r.x, r.y, r.w, r.h });
+    std::vector<pcover::Source> sources;
+    uint32_t stale = 0, unsupported = 0, swapped = 0;
+    for (dump::PSource &p : published)
+    {
+        const bool blittable = CoverageBlittable(static_cast<format>(p.fmt));
+        const int resolved = blittable ? dump::ResolveCurrent(p) : 0;   // may re-point p at this frame's texture
+        const bool current = resolved != 0;
+        if (!blittable) ++unsupported;
+        else if (!current) ++stale;
+        else if (resolved == 2) ++swapped;
+        // A widget whose texture is unusable this frame fails its block (tex_w 0).
+        sources.push_back({ { p.widget.x, p.widget.y, p.widget.w, p.widget.h }, p.uv_off[0], p.uv_off[1], p.uv_scale[0], p.uv_scale[1],
+                            current ? p.tex_w : 0u, p.tex_h });
+    }
+
+    uint32_t bits = 0;
+    uint32_t why[pcover::kResultCount] = {};
+    std::vector<std::vector<pcover::Blit>> plans(g_atlas.items.size());
+    std::vector<uint64_t> textures;
+    for (size_t i = 0; i < g_atlas.items.size() && i < size_t(pblend::kMaxBlocks); ++i)
+    {
+        const pcover::Result r = pcover::PlanItem(g_atlas.items[i], widgets, sources, sw, sh, plans[i]);
+        ++why[r];
+        if (r != pcover::kPlanned) { plans[i].clear(); continue; }
+        bits |= 1u << i;
+        for (const pcover::Blit &b : plans[i])
+            if (std::find(textures.begin(), textures.end(), published[b.source].res) == textures.end())
+                textures.push_back(published[b.source].res);
+    }
+    for (uint64_t t : textures) cl->barrier(resource{ t }, resource_usage::shader_resource, resource_usage::copy_source);
+    for (const std::vector<pcover::Blit> &blits : plans)
+        for (const pcover::Blit &b : blits)
+        {
+            const dump::PSource &p = published[b.source];
+            FeedVkBlitScaled(&g.vk, cb, reinterpret_cast<VkImage>(static_cast<uintptr_t>(p.res)), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             p.level, p.layer, g.vk_img[SLOT_COVER], VK_IMAGE_LAYOUT_GENERAL,
+                             b.sx0, b.sy0, b.sx1, b.sy1, b.dx0, b.dy0, b.dx1, b.dy1);
+        }
+    for (uint64_t t : textures) cl->barrier(resource{ t }, resource_usage::copy_source, resource_usage::shader_resource);
+
+    static bool said_swap = false;
+    if (swapped != 0 && !said_swap)
+    {
+        said_swap = true;
+        Log("[feed] coverage: followed a re-rendered portrait to this frame's texture (logged once)");
+    }
+    static uint32_t last_bits = UINT32_MAX;
+    static size_t last_items = 0;
+    static ULONGLONG last_log = 0;
+    const ULONGLONG now = GetTickCount64();
+    if ((bits != last_bits || g_atlas.items.size() != last_items) && now - last_log >= 100)   // per-frame flicker: ~10 lines/s
+    {
+        last_log = now;
+        // Fallback reasons per block; the source counts are per published source (swapped = followed to
+        // this frame's re-rendered texture; stale = not sampled this frame and no safe replacement).
+        Log("[feed] coverage: %u of %u block(s) masked by portrait alpha (mask 0x%X, %u texture(s), %u/%u source(s)/widget(s)); "
+            "fallback: overlap %u, no_source %u, unusable %u, no_widget %u; sources swapped %u, stale %u, unsupported %u",
+            static_cast<unsigned>(__popcnt(bits)), static_cast<unsigned>(g_atlas.items.size()), bits,
+            static_cast<unsigned>(textures.size()), static_cast<unsigned>(published.size()), static_cast<unsigned>(rects.size()),
+            why[pcover::kOverlap], why[pcover::kNoSource], why[pcover::kUnusable], why[pcover::kNoWidget], swapped, stale, unsupported);
+        last_bits = bits;
+        last_items = g_atlas.items.size();
+    }
+    return bits;
+}
+
+// ---------------------------------------------------------------------------
+// Frontier 3, texture-space portraits (portrait_texture=1): NR on the Portrait textures; the
+// game composites the enhanced copies ("shadows") through feed_render_dump.h's draw re-issue.
+// ---------------------------------------------------------------------------
+
+#include "feed_portrait_tex.h"
+static void PortraitTexReleaseTargets() { ptex::ReleaseTargets(); }
+static void PortraitTexRelease()        { ptex::Release(); }
+
+struct TexShadow { uint64_t res, gen; reshade::api::resource tex; reshade::api::resource_view view; };
+struct DoomedShadow { reshade::api::resource tex; reshade::api::resource_view view; uint64_t frame; };
+static reshade::api::device *g_shadow_dev = nullptr;
+static std::vector<TexShadow> g_tex_shadows;
+static std::vector<DoomedShadow> g_doomed_shadows;
+static std::vector<ptex::Slot> g_tex_slots;
+
+static void DestroyShadows(reshade::api::device *dev)
+{
+    if (dev == nullptr || dev != g_shadow_dev) return;
+    for (const TexShadow &s : g_tex_shadows) { dev->destroy_resource_view(s.view); dev->destroy_resource(s.tex); }
+    for (const DoomedShadow &s : g_doomed_shadows) { dev->destroy_resource_view(s.view); dev->destroy_resource(s.tex); }
+    g_tex_shadows.clear();
+    g_doomed_shadows.clear();
+    g_tex_slots.clear();
+    g_shadow_dev = nullptr;
+}
+
+// A shadow whose texture this frame no longer samples stops being used at once and is destroyed
+// once no frame still in flight can sample it.
+static void RetireShadows(const std::vector<ptex::Tex> &live)
+{
+    const uint64_t now = dump::g_frame.load();
+    for (size_t i = 0; i < g_tex_shadows.size();)
+    {
+        const TexShadow &s = g_tex_shadows[i];
+        if (std::none_of(live.begin(), live.end(), [&](const ptex::Tex &t) { return t.res == s.res && t.gen == s.gen; }))
+        {
+            dump::DropShadow(s.res, s.view.handle);
+            g_doomed_shadows.push_back({ s.tex, s.view, now });
+            g_tex_shadows[i] = g_tex_shadows.back();
+            g_tex_shadows.pop_back();
+        }
+        else ++i;
+    }
+    for (size_t i = 0; i < g_doomed_shadows.size();)
+        if (g_shadow_dev != nullptr && now - g_doomed_shadows[i].frame >= dump::kRetireFrames + 2)
+        {
+            g_shadow_dev->destroy_resource_view(g_doomed_shadows[i].view);
+            g_shadow_dev->destroy_resource(g_doomed_shadows[i].tex);
+            g_doomed_shadows[i] = g_doomed_shadows.back();
+            g_doomed_shadows.pop_back();
+        }
+        else ++i;
+}
+
+// Index of the shadow for t, created on first use (same size and format as the Portrait texture).
+static int EnsureShadow(reshade::api::device *dev, const ptex::Tex &t)
+{
+    using namespace reshade::api;
+    for (size_t i = 0; i < g_tex_shadows.size(); ++i)
+        if (g_tex_shadows[i].res == t.res && g_tex_shadows[i].gen == t.gen) return int(i);
+    if (g_shadow_dev != nullptr && g_shadow_dev != dev) return -1;
+    resource tex = {};
+    resource_view view = {};
+    if (!dev->create_resource(resource_desc(t.w, t.h, 1, 1, format::r8g8b8a8_unorm, 1, memory_heap::default_,
+                                            resource_usage::shader_resource | resource_usage::copy_dest),
+                              nullptr, resource_usage::shader_resource, &tex))
+    {
+        static bool said = false;
+        if (!said) Log("[feed] texture-space portraits: enhanced texture %ux%u could not be created", t.w, t.h);
+        said = true;
+        return -1;
+    }
+    if (!dev->create_resource_view(tex, resource_usage::shader_resource, resource_view_desc(format::r8g8b8a8_unorm), &view))
+    {
+        dev->destroy_resource(tex);
+        return -1;
+    }
+    g_shadow_dev = dev;
+    g_tex_shadows.push_back({ t.res, t.gen, tex, view });
+    return int(g_tex_shadows.size() - 1);
+}
+
+static void FeedFrameVkTex(reshade::api::effect_runtime *rt, reshade::api::command_list *cl)
+{
+    using namespace reshade::api;
+    device *dev_api = rt->get_device();
+
+    // This frame's Portrait textures, from its own draws: no readback, no screen geometry.
+    std::vector<dump::PortraitDraw> draws;
+    dump::CurrentFrameDraws(draws);
+    std::vector<ptex::Tex> textures;
+    for (size_t i = 0; i < draws.size(); ++i)
+    {
+        const dump::PortraitDraw &d = draws[i];
+        if (d.src_res == 0 || static_cast<format>(d.src_fmt) != format::r8g8b8a8_unorm) continue;
+        if (std::any_of(textures.begin(), textures.end(), [&](const ptex::Tex &t) { return t.res == d.src_res && t.gen == d.src_gen; })) continue;
+        textures.push_back({ d.src_res, d.src_gen, d.src_w, d.src_h, static_cast<uint32_t>(i), d.src_level, d.src_layer });
+    }
+    fstats::g_note.portraits = static_cast<uint32_t>(textures.size());
+    RetireShadows(textures);
+    if (ptex::AssignCells(g_tex_slots, textures)) { g.need_reset = true; g.reset_why |= portrait::kHistoryResized; }   // hover zoom
+
+    PortraitAtlas next;
+    if (g_tex_slots.empty() ||
+        !portrait::Allocate(ptex::Candidates(g_tex_slots), ptex::kSpace, ptex::kSpace, uint64_t(g_cfg.portrait_budget) * 1000, &g_atlas, next))
+    {
+        fstats::g_note.skip = textures.empty() ? fstats::SKIP_NO_PORTRAITS : fstats::SKIP_TOO_SMALL;
+        g.reset_why |= fstats::kResetResume;
+        g.need_reset = true;
+        return;
+    }
+    if (!portrait::SameHistory(g_atlas, next)) { g.need_reset = true; g.reset_why |= portrait::HistoryChange(g_atlas, next); }
+    if (!portrait::SameLayout(g_atlas, next))
+    {
+        char line[1024];
+        int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "[feed] portrait texture atlas %ux%u, %u texture(s):",
+                              next.w, next.h, static_cast<unsigned>(next.items.size()));
+        for (const AtlasItem &it : next.items)
+            if (len > 0 && len < static_cast<int>(sizeof(line)) - 48)
+                len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %dx%d@%d,%d", it.w, it.h, it.dx, it.dy);
+        Log("%s (%u sampled this frame)", line, static_cast<unsigned>(textures.size()));
+    }
+    g_atlas = std::move(next);
+    const UINT fw = g_atlas.w, fh = g_atlas.h;
+    fstats::g_note.atlas_w = fw;
+    fstats::g_note.atlas_h = fh;
+    fstats::g_note.blocks = static_cast<uint32_t>(g_atlas.items.size());
+
+    bool ok = true;
+    if (g.session_ready && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed] the game recreated its device; rebuilding the session");
+        ShutdownSession();
+    }
+    if (!g.session_ready) ok = InitSessionVk(rt);
+    const DXGI_FORMAT tf = DXGI_FORMAT_R8G8B8A8_UNORM;   // the Portrait textures' format (filtered above)
+    const bool needs_build = !g.frame_ready || fw != g.width || fh != g.height || tf != g.bb_fmt;
+    if (ok && g_renodx_present && needs_build && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)", g_cfg.create_delay);
+        ok = false;
+    }
+    if (ok && needs_build)
+    {
+        Log("[feed] building: %ux%u portrait texture atlas (Vulkan transport)", fw, fh);
+        fstats::g_note.build = true;
+        ok = BuildResourcesVk(fw, fh, tf);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+    if (ok && g.frame_ready && g.color_fmt != tf)
+    {
+        static bool said = false;
+        if (!said) Log("[feed] texture-space portraits: atlas format %s cannot hold the portraits raw; skipped", FormatName(g.color_fmt));
+        said = true;
+        ok = false;
+    }
+    if (ok && g.frame_ready && g_cfg.vk_present_sync && !FeedVkOrderPresent(rt, cl))
+    {
+        static bool warned = false;
+        if (!warned) Log("[feed] texture-space portraits skipped: no usable present dependency context");
+        warned = true;
+        return;
+    }
+    if (!(ok && g.frame_ready)) return;
+
+    // Shadows first: creating one may record its initial transition on this queue.
+    std::vector<int> shadow(g_atlas.items.size(), -1);
+    std::vector<const ptex::Slot *> slot(g_atlas.items.size(), nullptr);
+    std::vector<uint64_t> sources;
+    for (size_t i = 0; i < g_atlas.items.size(); ++i)
+    {
+        slot[i] = ptex::SlotOf(g_tex_slots, g_atlas.items[i]);
+        if (slot[i] == nullptr) continue;
+        shadow[i] = EnsureShadow(dev_api, slot[i]->tex);
+        if (std::find(sources.begin(), sources.end(), slot[i]->tex.res) == sources.end()) sources.push_back(slot[i]->tex.res);
+    }
+
+    VkCommandBuffer cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
+    Breadcrumb("copying portrait textures (Vulkan)");
+    {
+        const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        for (int i = 0; i < SLOT_COUNT; ++i)
+            if (g.vk_img[i] != VK_NULL_HANDLE) FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+        g.vk_layout_init = true;
+    }
+    FeedVkClearAtlas(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_NULL_HANDLE);
+    // This frame's GUI pass sampled every one of them: they are in shader-read state.
+    for (uint64_t t : sources) cl->barrier(resource{ t }, resource_usage::shader_resource, resource_usage::copy_source);
+    // Each texture at its slot's top-left; the rest of a (32 px quantised) slot stays cleared.
+    for (size_t i = 0; i < g_atlas.items.size(); ++i)
+        if (slot[i] != nullptr)
+            FeedVkCopySub(&g.vk, cb, reinterpret_cast<VkImage>(static_cast<uintptr_t>(slot[i]->tex.res)), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          slot[i]->tex.level, slot[i]->tex.layer, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL,
+                          g_atlas.items[i].dx, g_atlas.items[i].dy, slot[i]->tex.w, slot[i]->tex.h);
+    for (uint64_t t : sources) cl->barrier(resource{ t }, resource_usage::copy_source, resource_usage::shader_resource);
+    // A portrait does not move inside its texture; it has no depth NR could use. Flat inputs.
+    FeedVkClear(&g.vk, cb, g.vk_img[SLOT_MV], 0.0f);
+    {
+        const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+        FeedVkClear(&g.vk, cb, g.vk_img[SLOT_DEPTH], inverted ? 0.0f : 1.0f);
+    }
+
+    const UINT64 n = ++g.vk_frame;
+    const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+    fstats::g_note.reset = reset;
+    fstats::g_note.reset_why = g.reset_why | (g_cfg.reset_every ? fstats::kResetEvery : 0u);
+    g.need_reset = false;
+    g.reset_why = 0;
+
+    Breadcrumb("signalling the game-side fence (Vulkan, portrait textures)");
+    g.rs_queue->flush_immediate_command_list();
+    g.rs_queue->signal(g.rs_fence_in, n);
+
+    bool done = false;
+    if (!BeginCommands()) FeedFail("command list");
+    else
+    {
+        g.queue->Wait(g.fence12_in, n);
+        Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+        ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+        ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+        ep.pInDepth          = g.tex12[SLOT_DEPTH];
+        ep.pInMotionVectors  = g.tex12[SLOT_MV];
+        ep.InRenderSubrectDimensions.Width  = g.width;
+        ep.InRenderSubrectDimensions.Height = g.height;
+        ep.InReset           = reset;
+        ep.InMVScaleX        = g_cfg.mv_scale_x;
+        ep.InMVScaleY        = g_cfg.mv_scale_y;
+        ep.InPreExposure     = 1.0f;
+        ep.InExposureScale   = 1.0f;
+
+        Breadcrumb("running the D3D12 evaluate (Vulkan transport, portrait textures)");
+        DWORD ecode = 0;
+        NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+        if (ecode != 0)
+        {
+            AbortCommands();
+            Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+            FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+            g.frame_ready = false;
+        }
+        else
+        {
+            // The game's alpha back on the NR colour; without the pass the copies must not be used.
+            const bool finished = !NVSDK_NGX_FAILED(re) &&
+                ptex::EnsureResources(g.dev12, g.tex12[SLOT_COLOR], g.tex12[SLOT_OUTPUT], g.color_fmt, g.output_fmt);
+            if (finished) ptex::Record(g.list, g.tex12[SLOT_OUTPUT], g.width, g.height);
+            Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            const UINT64 submitted = EndCommands();
+            if (submitted == 0) g.frame_ready = false;
+            else if (NVSDK_NGX_FAILED(re))
+            {
+                Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                FeedFail("evaluate");
+                g.frame_ready = false;
+            }
+            else done = finished;
+        }
+    }
+    if (done) g.queue->Signal(g.fence12_out, n);
+    else      g.fence12_out->Signal(n);
+
+    // Copy each enhanced portrait into its shadow on the game's queue, after the D3D12 work.
+    Breadcrumb("waiting for the result (Vulkan, portrait textures)");
+    g.rs_queue->wait(g.rs_fence_out, n);
+    cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
+    uint32_t published = 0;
+    if (done)
+    {
+        const bool raw = SameTexelLayout(g.output_fmt, DXGI_FORMAT_R8G8B8A8_UNORM);
+        for (size_t i = 0; i < g_atlas.items.size(); ++i)
+        {
+            if (slot[i] == nullptr || shadow[i] < 0) continue;
+            const TexShadow &s = g_tex_shadows[size_t(shadow[i])];
+            const AtlasItem &it = g_atlas.items[i];
+            cl->barrier(s.tex, resource_usage::shader_resource, resource_usage::copy_dest);
+            (raw ? FeedVkCopyRegion : FeedVkBlitRegion)(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                reinterpret_cast<VkImage>(static_cast<uintptr_t>(s.tex.handle)), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                it.dx, it.dy, 0, 0, slot[i]->tex.w, slot[i]->tex.h);
+            cl->barrier(s.tex, resource_usage::copy_dest, resource_usage::shader_resource);
+            const uint32_t first = slot[i]->tex.index;
+            dump::SetShadow(s.res, s.gen, s.view.handle, first, first < draws.size() ? &draws[first] : nullptr);
+            ++published;
+        }
+    }
+
+    fstats::g_note.skip = done ? fstats::SKIP_NONE : fstats::SKIP_FAILED;
+    fstats::g_note.evaluated = done;
+    if (done)
+    {
+        const UINT64 fn = ++g.frames_done;
+        g.consecutive_fails = 0;
+        if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+            Log("[feed] frame %llu delivered (%ux%u portrait texture atlas, %u enhanced texture(s), reset=%d)", fn, g.width, g.height,
+                published, reset);
+        if (g_renodx_present && g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+        {
+            g.warmup_done = true;
+            g.frame_ready = false;
+            Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, portrait textures)", fn);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per frame, Vulkan transport: ReShade's command list carries the copies between
 // the game's images and the shared ones, ReShade's queue signal/wait carries the
@@ -2264,6 +2687,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     static UINT64 calls = 0;
     if ((calls++ % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
+    if (g_portrait_tex && g_cfg.portrait_mode && g_cfg.mode == 2)
+    {
+        FeedFrameVkTex(rt, cl);
+        QueryPerformanceCounter(&t1);
+        TimingTick(t0.QuadPart, t1.QuadPart);
+        return;
+    }
 
     device *dev_api = rt->get_device();
 
@@ -2326,9 +2756,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     // eligible portraits means no neural evaluation and an untouched game frame.
     const bool portraits = g_cfg.portrait_mode != 0 && g_cfg.mode == 2;
     UINT fw = w, fh = h;
+    std::vector<dump::PRect> rects;
     if (portraits)
     {
-        std::vector<dump::PRect> rects;
         dump::GetPortraits(rects);
         fstats::g_note.portraits = static_cast<uint32_t>(rects.size());
         fstats::g_note.rect_age = dump::PortraitAge();
@@ -2420,7 +2850,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         {
             const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
             for (int i = 0; i < SLOT_COUNT; ++i)
-                FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+                if (g.vk_img[i] != VK_NULL_HANDLE) FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
             g.vk_layout_init = true;
         }
         // Game images -> copy_source via ReShade (its layout tracking stays correct),
@@ -2440,9 +2870,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     FeedVkCopyRegion(&g.vk, cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[slot], VK_IMAGE_LAYOUT_GENERAL,
                                      it.sx, it.sy, it.dx, it.dy, static_cast<UINT>(it.w), static_cast<UINT>(it.h));
         };
+        const bool cover = portraits && g.vk_img[SLOT_COVER] != VK_NULL_HANDLE && g.tex12[SLOT_COVER] != nullptr;
         if (portraits)
-            FeedVkClearAtlas(&g.vk, cb, g.vk_img[SLOT_COLOR], g.mask_ok ? g.vk_img[SLOT_MASK] : VK_NULL_HANDLE);
+            FeedVkClearAtlas(&g.vk, cb, g.vk_img[SLOT_COLOR], g.mask_ok ? g.vk_img[SLOT_MASK] : VK_NULL_HANDLE,
+                             cover ? g.vk_img[SLOT_COVER] : VK_NULL_HANDLE);
         copy_in(bb_img, SLOT_COLOR);
+        const uint32_t cover_bits = cover ? RecordCoverageVk(cl, cb, rects, w, h) : 0u;
         // GUI portraits do not move on screen; VORT's vectors there describe the map behind them, and
         // following those (zooming, panning) drags the portrait's history around inside its block.
         if (!portraits)
@@ -2532,6 +2965,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (cover) Barrier(g.tex12[SLOT_COVER], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -2564,12 +2998,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
-                    // Portrait mode: fade NR in over each block margin (input -> NR), in place on Output.
-                    if (portraits && g_cfg.portrait_feather > 0 && !NVSDK_NGX_FAILED(re) &&
+                    // Portrait mode: fade NR in over each block margin (input -> NR), in place on Output;
+                    // a block with coverage keeps NR only on the character (Frontier 3).
+                    if (portraits && (g_cfg.portrait_feather > 0 || cover_bits != 0) && !NVSDK_NGX_FAILED(re) &&
                         pblend::EnsureResources(g.dev12, g.tex12[SLOT_COLOR], g.tex12[SLOT_OUTPUT], g.width, g.height,
-                                                g.color_fmt, g.output_fmt))
+                                                g.color_fmt, g.output_fmt, cover ? g.tex12[SLOT_COVER] : nullptr, true))
                     {
                         pblend::Cb cbd = {};
+                        cbd.coverage_blocks = cover_bits;
                         for (const AtlasItem &it : g_atlas.items)
                         {
                             if (cbd.count == static_cast<uint32_t>(pblend::kMaxBlocks)) break;
@@ -2585,6 +3021,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    if (cover) Barrier(g.tex12[SLOT_COVER], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                     const UINT64 submitted = EndCommands();
                     if (submitted == 0) { g.frame_ready = false; }
@@ -3041,7 +3478,10 @@ static void OnDestroyDevice(reshade::api::device *dev)
     // This also covers transport-off sessions. CK3's layer/Streamline startup can
     // bypass the loader create hook, so init_device owns an early fallback hook.
     if (dev->get_api() == reshade::api::device_api::vulkan)
+    {
         FeedVkPresentForgetDevice(FeedVkDispatch<VkDevice>(dev->get_native()));
+        DestroyShadows(dev);
+    }
     if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
@@ -3228,7 +3668,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_overlay(nullptr, DrawOverlay);
-        if (g_cfg.render_dump || g_cfg.portrait_mode) { dump::Register(g_cfg.render_dump != 0); g_dump_registered = true; }
+        g_portrait_tex = g_cfg.portrait_mode && g_cfg.portrait_texture;
+        g_portrait_cover = g_cfg.portrait_mode && g_cfg.portrait_coverage && !g_portrait_tex;
+        if (g_cfg.render_dump || g_cfg.portrait_mode)
+        {
+            dump::Register(g_cfg.render_dump != 0, g_portrait_cover, g_portrait_tex);
+            g_dump_registered = true;
+        }
         fstats::Register();   // inert until frame_stats=1 (live)
     }
     else if (reason == DLL_PROCESS_DETACH)

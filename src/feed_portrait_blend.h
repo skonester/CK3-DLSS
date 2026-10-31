@@ -3,7 +3,7 @@
 // Recorded after evaluation on the private D3D12 list. Atlas padding is never pasted home.
 //
 // Frontier 3 (section 2): a block flagged in Cb::coverage_blocks is composited with a character
-// coverage atlas (R8, same coordinates as the colour atlas): one job covers the whole block,
+// coverage atlas (R8, or RGBA8 read through its alpha; same coordinates as the colour atlas): one job covers the whole block,
 // interior included, and out = src + (neural - src) * feather_weight * coverage. Coverage 0
 // restores the original pixel bit-exactly and coverage 1 keeps the neural pixel bit-exactly.
 // Unflagged blocks keep the legacy edge-band feather. Flags are ignored while no coverage
@@ -240,10 +240,13 @@ static bool SupportsInPlace(ID3D12Device *dev, DXGI_FORMAT format)
 }
 
 // Rebind after a feature rebuild. Only devices without typed loads pay for a scratch atlas.
-// `cover` (optional) is the R8_UNORM coverage atlas; it is bound with the other atlas resources
-// because the descriptor heap is shared by all frame slots and may only change on a rebuild.
+// `cover` (optional) is the coverage atlas; it is bound with the other atlas resources because the
+// descriptor heap is shared by all frame slots and may only change on a rebuild. It is R8_UNORM,
+// or with cover_alpha R8G8B8A8_UNORM whose alpha is coverage (the game's portrait alpha, blitted):
+// the view's component mapping routes alpha into the channel the shader reads.
 static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Resource *output,
-                            UINT w, UINT h, DXGI_FORMAT color_fmt, DXGI_FORMAT out_fmt, ID3D12Resource *cover = nullptr)
+                            UINT w, UINT h, DXGI_FORMAT color_fmt, DXGI_FORMAT out_fmt, ID3D12Resource *cover = nullptr,
+                            bool cover_alpha = false)
 {
     if (g_failed) return false;
     if (g_bound_color == color && g_bound_output == output && g_bound_cover == cover && g_cb_ptr != nullptr) return true;
@@ -300,8 +303,11 @@ static bool EnsureResources(ID3D12Device *dev, ID3D12Resource *color, ID3D12Reso
     sv.Format = color_fmt;
     dev->CreateShaderResourceView(color, &sv, h0);
     h0.ptr += inc;
-    sv.Format = DXGI_FORMAT_R8_UNORM;
+    sv.Format = cover != nullptr && cover_alpha ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM;
+    if (cover != nullptr && cover_alpha)
+        sv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3, 3);
     dev->CreateShaderResourceView(cover, &sv, h0);   // nullptr: a null descriptor that reads 0
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     h0.ptr += inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {};
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;

@@ -488,8 +488,10 @@ function New-DefaultFeederConfig([string]$SelectedMode) {
     $preset = 13
     # DLSS 5 profiles run neural rendering on the character portraits only (Frontier 1/2):
     # the whole frame drops CK3 to ~17 fps on an RTX 3060. DLSS 4.5 stays full-frame DLAA.
+    # portrait_texture=1 (Frontier 3): NR runs on the portrait textures and the game composites
+    # them, so no rectangle around characters on the map or in panels.
     $portrait = if ($SelectedMode -eq 'DLSS45') { '' } else {
-        "render_dump=0`r`nportrait_mode=1`r`nportrait_min=48`r`nportrait_feather=16`r`nportrait_budget=400`r`n"
+        "render_dump=0`r`nportrait_mode=1`r`nportrait_min=48`r`nportrait_feather=16`r`nportrait_budget=400`r`nportrait_texture=1`r`n"
     }
     return @"
 # CK3 portable profile: $SelectedMode
@@ -551,6 +553,12 @@ function Install-ActiveProfile(
     $profileConfig = Join-Path (Join-Path $profileRoot $SelectedMode) 'dlss5-feed.cfg'
     $activeConfig = Join-Path $activeRoot 'dlss5-feed.cfg'
     if (Test-Path -LiteralPath $profileConfig -PathType Leaf) {
+        # Portrait profiles saved before 1.0.6 gain texture-space portraits (no box around characters).
+        $saved = [IO.File]::ReadAllText($profileConfig)
+        if ($SelectedMode -ne 'DLSS45' -and $saved -match '(?m)^portrait_mode=1' -and $saved -notmatch '(?m)^portrait_texture=') {
+            $saved = $saved.TrimEnd("`r", "`n") + "`r`nportrait_texture=1`r`n"
+            [IO.File]::WriteAllText($profileConfig, $saved, [Text.UTF8Encoding]::new($false))
+        }
         Copy-Item -LiteralPath $profileConfig -Destination $activeConfig -Force
     }
     else {

@@ -164,7 +164,7 @@ switch ($Action) {
         Assert-GameClosed
         if (-not $Set) { throw '-Set key=value[,key=value] is required' }
         if (-not (Test-Path -LiteralPath $cfgPath)) { throw "no config at $cfgPath" }
-        $allowed = 'render_dump', 'frame_stats', 'portrait_mode', 'portrait_feather', 'portrait_budget', 'portrait_min'
+        $allowed = 'render_dump', 'frame_stats', 'portrait_mode', 'portrait_feather', 'portrait_budget', 'portrait_min', 'portrait_coverage', 'portrait_texture'
         $b = New-Backup 'frontier3-cfg' @('dlss-active\dlss5-feed.cfg')
         $lines = [Collections.Generic.List[string]]::new([string[]](Get-Content -LiteralPath $cfgPath))
         foreach ($pair in $Set) {
