@@ -1,32 +1,34 @@
-# Crusader Kings III DLSS Vulkan
+# Crusader Kings III DLSS 5
 
 <p align="center">
   <img src="resources/CK3DLSS5.jpg" alt="CK3 DLSS 5" width="720">
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/release-1.0.6-76B900?style=for-the-badge" alt="Release 1.0.6">
   <img src="https://img.shields.io/badge/Vulkan-1.3-blue?style=for-the-badge&logo=vulkan" alt="Vulkan 1.3">
   <img src="https://img.shields.io/badge/ReShade-6.8-blue?style=for-the-badge" alt="ReShade">
   <img src="https://img.shields.io/badge/DLSS-NVIDIA-76B900?style=for-the-badge&logo=nvidia" alt="DLSS">
 </p>
 
-NVIDIA DLSS for **Crusader Kings III** on Windows: sharper, more stable images and DLSS 5 Neural
-Rendering on character faces. Drop it into your CK3 folder, pick a profile, and play. It only
-affects CK3, and you can switch it off at any time.
+**Version 1.0.6, out of beta.** NVIDIA DLSS 5 Neural Rendering for the character portraits in
+**Crusader Kings III**: more lifelike faces, hair and clothing on every portrait, from your ruler
+in the corner of the map to the council and character windows.
 
-> [!IMPORTANT]
-> **Current work: [Frontier 2](frontier2.md), not in a release yet.**
-> DLSS 5 Neural Rendering used to run at about **15 fps on an RTX 3060** because it processed the
-> whole screen. Frontier 1 applies it **only to the character portraits**, which brings that to
-> **about 40 fps**, and CK3 now starts in seconds instead of minutes.
-> There is still a slight square box around portraits, most visible while zooming the map.
-> **The remaining mask fix and live validation are planned in [Frontier 3](frontier3.md).**
-> Frontier 3 diagnostics and the coverage blend are built and tested offline; live capture is next.
-> The download below is the previous release. [Read the full Frontier 1 log](frontier.md).
-> Frontier 2 now optimizes the portrait blend with edge-only compute and in-place GPU reads.
-> Persistent atlas slots now enforce the budget on the full texture and reduce rebuilds
-> in recorded-scene replay. The alpha-mask fix and new in-game measurements remain pending.
-> [Measured results and remaining work](frontier2.md).
+> [!TIP]
+> **For the portrait enhancements, pick the DLSS 5 Extended profile in the installer.** The app
+> shows it with an *Experimental* tag because it uses a community DLSS 5 runtime, but it's the
+> profile this release was built and tested on.
+
+## What's new in 1.0.6
+
+- **Portrait mode is finished.** DLSS 5 now enhances the portrait images themselves, and the game
+  draws them as usual. The square box that used to surround characters on the map and in windows
+  is gone.
+- **Hovering stays enhanced.** Moving the mouse over your ruler's portrait no longer switches
+  DLSS 5 off for a moment.
+- **Playable on mid-range cards.** About 42 fps on an RTX 3060 with DLSS 5 on, where running it on
+  the whole screen gave about 15 fps. CK3 still starts in seconds.
 
 ## What you need
 
@@ -37,82 +39,79 @@ affects CK3, and you can switch it off at any time.
 ## Install
 
 1. Close Crusader Kings III and the Paradox launcher.
-2. Download **`CK3-DLSS-Vulkan-All-Profiles.zip`** from the
-   [latest release](../../releases/latest).
-3. In Steam, right-click **Crusader Kings III**, then choose **Manage → Browse local files**.
-4. Copy everything from the ZIP into that folder. `Launch CK3 with DLSS.cmd` should end up next to
-   the `binaries`, `game` and `launcher` folders, not inside `binaries`.
-5. Double-click **`Open CK3 DLSS Installer.cmd`**, pick a profile (see below), accept the licenses,
-   and install.
+2. Download **`CK3-DLSS.zip`** from the [latest release](../../releases/latest) and extract it
+   anywhere, for example your Downloads folder.
+3. Open the **`tools`** folder, then **`CK3-DLSS-Installer`**, and double-click
+   **`CK3 DLSS Installer.exe`**. Everything else is done from this app.
+4. Check that the app found your CK3 folder, select **DLSS 5 Extended**, tick the license box and
+   press **Install**. The app copies everything into your CK3 folder for you.
+5. Press **Launch CK3**.
+
+You don't need to copy any files yourself.
 
 ## Play
 
-Start the game with **`Launch CK3 with DLSS.cmd`**.
+Start the game from the installer with **Launch CK3**, or with **`Launch CK3 with DLSS.cmd`** in
+your CK3 folder.
 
 > [!NOTE]
-> Steam's normal **Play** button starts CK3 without DLSS. Always use `Launch CK3 with DLSS.cmd`.
-
-## Which profile should I pick?
-
-| Profile | Pick it if… |
-|---|---|
-| **DLSS 4.5 (Model M)** | You have an RTX 20, 30 or 40 card. **Recommended.** Smooth, stable image across the whole screen. |
-| **DLSS 5 Stock** | Your card is supported by NVIDIA's DLSS 5 preview. Adds Neural Rendering, which is heavy on the GPU. |
-| **DLSS 5 Extended** | You want to try DLSS 5 on cards the stock version doesn't support. Experimental and may be unstable. |
-
-To change profiles later, close CK3 and run `Open CK3 DLSS Installer.cmd` again.
-
-A fourth, developer-only option (**Native Streamline**) exists for testing and is not meant for
-normal play.
-
-## In-game controls
+> Steam's normal **Play** button starts CK3 without DLSS.
 
 | Key | What it does |
 |---|---|
+| **F6** | Turns DLSS 5 on or off, so you can compare. |
 | **Home** | Opens the ReShade menu. DLSS settings are on its **Add-ons** tab. |
-| **F6** | Turns DLSS 5 Neural Rendering on or off (DLSS 5 profiles). |
-| **F5** | Takes a screenshot through the DLSS 5 add-on (DLSS 5 profiles). |
+| **F5** | Takes a screenshot through the DLSS 5 add-on. |
 
-In the ReShade menu, keep **`vort_MotionEffects` above `DLSS5_Feed`** in the effect list. The
-included preset is already in the right order.
+DLSS 5 shows on the portraits only; the map and interface keep CK3's own look. The enhanced
+portraits appear as soon as a portrait is on screen. On the loading screen, the very tall
+portraits stay as the game draws them.
 
-## Uninstall or turn it off
+## Profiles
 
-Run **`Disable CK3 DLSS.cmd`**, then start CK3 normally from Steam. This restores your original
-renderer setting. To remove the package completely, delete the files you copied in.
+| Profile in the app | What it does |
+|---|---|
+| **DLSS 5 Extended** | **Use this one.** DLSS 5 Neural Rendering on the character portraits. Runs on more cards than NVIDIA's preview through the ShortFuse runtime (tested on an RTX 3060). |
+| DLSS 4.5 | Model M anti-aliasing across the whole screen at native resolution, no portrait enhancement. The app tags it *Recommended* as the safe fallback if DLSS 5 doesn't run on your card. |
+| DLSS 5 | NVIDIA's signed DLSS 5 runtime, for cards its preview supports. |
+| Native Streamline | Developer testing only. Not for normal play. |
+
+To change profiles, close CK3, open the installer again, pick another profile and press
+**Install**.
+
+## Uninstall
+
+Open the installer and press **Uninstall**. It puts CK3's original renderer setting back and
+removes every file it added. Your saves and the game's own files are not touched.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `binaries\ck3.exe was not found` | You copied the files one folder too deep. Copy them into the main CK3 folder instead. |
-| No ReShade menu or no DLSS | Start the game with `Launch CK3 with DLSS.cmd`, not Steam's Play button. |
-| "Validation failed" | Close CK3, copy the ZIP contents in again (overwrite everything), and reinstall your profile. |
-| Very low fps on DLSS 5 | DLSS 5 Neural Rendering is heavy. Press **F6** to turn it off, or switch to the DLSS 4.5 profile. The Frontier 1 work (above) fixes this for a future release. |
-| Ghosting when panning the map, around UI, smoke or water | CK3 has no built-in motion data for DLSS, so it is estimated. Some ghosting during fast movement is expected. |
+| No ReShade menu, or portraits look unchanged | Start the game with **Launch CK3** in the installer, not Steam's Play button. Press **F6** in case DLSS 5 was switched off. |
+| The installer can't find CK3 | Point it at the folder Steam opens from **Crusader Kings III → Manage → Browse local files**. |
+| "Validation failed" | Close CK3, press **Install** again in the installer. |
+| Low frame rate | Make sure you picked **DLSS 5 Extended**, which only processes the portraits. If your card still struggles, press **F6** or switch to the DLSS 4.5 profile. |
 | RHI or ReShade asks to replace `dxgi.dll` | Say no for CK3. This package's `dxgi.dll` is required. RHI itself can stay installed. |
-| Something is broken and you want your game back | Run `Disable CK3 DLSS.cmd`, then launch CK3 from Steam. |
+| You want your game back right away | Press **Uninstall** in the installer, then play from Steam. |
 
 Don't combine this with OptiScaler, NVIDIA Smooth Motion, or another DLSS or ReShade injector for
 CK3.
 
-If you report a problem, please include these log files from the `binaries` folder:
+If you report a problem, please include these files from your CK3 `binaries` folder:
 `dlss-active\dlss5-feed.log`, `dlss5-vulkan\feed-vk-layer.log`, `dlss5-dxgi.log` and `ReShade.log`.
 
 ## Good to know
 
-- This is **experimental** software.
-- It changes CK3's renderer to **Vulkan**. `Disable CK3 DLSS.cmd` puts your previous setting back.
-- The default DLSS 4.5 profile runs at your native resolution for image quality (DLAA). It is not
-  a performance upscaler.
-- It does not replace `ck3.exe`, does not install anything system-wide, and does not affect other
-  games.
+- It switches CK3's renderer to **Vulkan**. Uninstall puts your previous setting back.
+- It does not replace `ck3.exe`, installs nothing system-wide, and does not affect other games.
 
 ## For developers
 
-- [frontier.md](frontier.md): portrait-only DLSS 5 design and Frontier 1 measurements.
-- [frontier2.md](frontier2.md): portrait blend and atlas optimization, GPU benchmarks, recorded-scene replay, and regression checks.
-- [frontier3.md](frontier3.md): next-agent handoff for portrait coverage, live measurements, metadata/history, and depth investigation.
+- [frontier4milestone.md](frontier4milestone.md): the current state (1.0.6) and what it took to get
+  here.
+- [frontier.md](frontier.md), [frontier2.md](frontier2.md), [frontier3.md](frontier3.md): the
+  portrait-mode work, measurements and test logs, step by step.
 - [architecture.md](architecture.md): how the DXGI bridge, Vulkan layer, feeder and profiles fit
   together, plus the package layout.
 - [UPSTREAM-COMPAT-TESTING.md](UPSTREAM-COMPAT-TESTING.md): upstream fixes ported and how they
@@ -126,7 +125,8 @@ build-local-current-tree.cmd
 layer\build-layer-local.cmd
 ```
 
-Outputs: `build\dlss5-feed.addon64`, `layer\VkLayer_feed_vk.dll`, `layer\dxgi.dll`.
+Outputs: `build\dlss5-feed.addon64`, `layer\VkLayer_feed_vk.dll`, `layer\dxgi.dll`. Releases are
+built by the **Installer GUI** workflow from `ck3-package` and `installer-gui`.
 
 ## Credits and licenses
 
