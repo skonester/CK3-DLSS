@@ -5,13 +5,13 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/release-1.0.6-76B900?style=for-the-badge" alt="Release 1.0.6">
+  <img src="https://img.shields.io/badge/release-1.0.7-76B900?style=for-the-badge" alt="Release 1.0.7">
   <img src="https://img.shields.io/badge/Vulkan-1.3-blue?style=for-the-badge&logo=vulkan" alt="Vulkan 1.3">
   <img src="https://img.shields.io/badge/ReShade-6.8-blue?style=for-the-badge" alt="ReShade">
   <img src="https://img.shields.io/badge/DLSS-NVIDIA-76B900?style=for-the-badge&logo=nvidia" alt="DLSS">
 </p>
 
-**Version 1.0.6, out of beta.** NVIDIA DLSS 5 Neural Rendering for the character portraits in
+**Version 1.0.7, out of beta.** NVIDIA DLSS 5 Neural Rendering for the character portraits in
 **Crusader Kings III**: more lifelike faces, hair and clothing on every portrait, from your ruler
 in the corner of the map to the council and character windows.
 
@@ -19,6 +19,13 @@ in the corner of the map to the council and character windows.
 > **For the portrait enhancements, pick the DLSS 5 Extended profile in the installer.** The app
 > shows it with an *Experimental* tag because it uses a community DLSS 5 runtime, but it's the
 > profile this release was built and tested on.
+
+## What's new in 1.0.7
+
+- **Experimental upscaling tests for developers.** The installer has a new panel for trying FSR 3.1
+  and FSR 1 upscaling alongside DLSS 5 portraits. It only works from a source checkout with the
+  local measurement tools staged, and the upscaling is still being tuned. Normal play and the
+  install profiles are unchanged.
 
 ## What's new in 1.0.6
 

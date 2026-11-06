@@ -155,6 +155,8 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
     var confirmDisable by remember { mutableStateOf(false) }
     var confirmUninstall by remember { mutableStateOf(false) }
     var uninstalled by remember { mutableStateOf(false) }
+    var fsrMode by remember { mutableStateOf(FsrGpuMode.Off) }
+    var measurementPending by remember { mutableStateOf(false) }
     val busy = outcome is Outcome.Running
 
     // Keep the status tiles current: after operations, after the game closes, or a folder change.
@@ -166,6 +168,8 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
             status = s
             gameRunning = running
             uplift = withContext(Dispatchers.IO) { root?.let(backend::readNeuralUplift) }
+            measurementPending = withContext(Dispatchers.IO) { root?.let(backend::measurementPending) ?: false }
+            if (running) withContext(Dispatchers.IO) { root?.let(backend::readMeasurementMode) }?.let { fsrMode = it }
             if (selected == null && s != null) selected = s.profile ?: InstallProfile.DLSS45
             delay(3000)
         }
@@ -201,6 +205,8 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             TopBar(gameRunning)
+
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(20.dp)) {
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                 FolderTile(
@@ -255,7 +261,7 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
                 InGameStrip(
                     neural = active.usesNeuralRendering,
                     uplift = uplift,
-                    canToggle = root != null && !gameRunning && !busy,
+                    canToggle = root != null && !gameRunning && !busy && !measurementPending,
                     gameRunning = gameRunning,
                     onToggle = { on ->
                         val target = root ?: return@InGameStrip
@@ -264,7 +270,17 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
                 )
             }
 
-            Spacer(Modifier.weight(1f))
+            if (active == InstallProfile.DLSS5_EXTENDED || measurementPending) {
+                FsrMeasurementPanel(
+                    mode = fsrMode, onMode = { fsrMode = it }, ready = backend.measurementReady(),
+                    busy = busy, gameRunning = gameRunning, pending = measurementPending,
+                    onAction = { action ->
+                        root?.let { target -> run("FSR measurement: ${action.name}") { onLine -> backend.runMeasurement(action, fsrMode, target, onLine) } }
+                    },
+                    onReports = { root?.let { backend.openFolder(it.resolve("binaries/fsr-measurements")) } },
+                )
+            }
+            }
 
             ActionPanel(
                 outcome = outcome,
@@ -282,12 +298,12 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
                     profile -> "Reinstall ${profile.title}"
                     else -> "Switch to ${profile.title}"
                 },
-                primaryEnabled = canAct && licensesAccepted && !gameRunning,
+                primaryEnabled = canAct && licensesAccepted && !gameRunning && !measurementPending,
                 onPrimary = {
                     val target = root ?: return@ActionPanel
                     run("Installing ${profile.title}") { onLine -> backend.runAction(InstallerAction.INSTALL, profile, target, onLine) }
                 },
-                launchEnabled = canAct && active != null && !gameRunning,
+                launchEnabled = canAct && active != null && !gameRunning && !measurementPending,
                 onLaunch = {
                     val target = root ?: return@ActionPanel
                     run("Checking the install before launch") { onLine -> backend.launchGame(target, onLine) }
@@ -297,9 +313,9 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
                     val target = root ?: return@ActionPanel
                     run("Checking the install") { onLine -> backend.runAction(InstallerAction.VALIDATE, profile, target, onLine) }
                 },
-                offEnabled = canAct && active != null && !gameRunning,
+                offEnabled = canAct && active != null && !gameRunning && !measurementPending,
                 onOff = { confirmDisable = true },
-                uninstallEnabled = root != null && !busy && !gameRunning && !uninstalled,
+                uninstallEnabled = root != null && !busy && !gameRunning && !uninstalled && !measurementPending,
                 onUninstall = { confirmUninstall = true },
                 gameRunning = gameRunning,
             )
@@ -358,6 +374,40 @@ private fun InstallerScreen(backend: InstallerBackend, owner: AwtWindow) {
                 },
                 dismissButton = { TextButton(onClick = { confirmDisable = false }) { Text("Cancel", color = TextMain) } },
             )
+        }
+    }
+}
+
+@Composable
+private fun FsrMeasurementPanel(
+    mode: FsrGpuMode, onMode: (FsrGpuMode) -> Unit, ready: Boolean, busy: Boolean,
+    gameRunning: Boolean, pending: Boolean, onAction: (FsrMeasurementAction) -> Unit, onReports: () -> Unit,
+) {
+    Surface(color = Panel, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, Hairline)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("FSR 3.1 measurement", fontWeight = FontWeight.SemiBold, color = TextMain)
+            Text("DLSS 5 Extended + portraits on NVIDIA. FSR upscales the 720p scene to 1080p before the interface is drawn. " +
+                "Run comparison loads a private copy of your last save in each mode, records 30 seconds and restores your settings. " +
+                "Your saves are not touched. Leave the game alone while it runs, about 6 minutes.", color = TextMuted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FsrGpuMode.entries.forEach { option ->
+                    OutlinedButton(onClick = { onMode(option) }, enabled = !busy && !gameRunning,
+                        border = BorderStroke(1.dp, if (option == mode) GreenText else Hairline),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = if (option == mode) GreenText else TextMuted)) {
+                        Text((if (option == mode) "✓ " else "") + option.label)
+                    }
+                }
+            }
+            if (!ready) Text("Local tools unavailable. Run Stage-CK3-FsrMeasurement.ps1 in the checkout.", color = Amber, fontSize = 12.sp)
+            Text(if (pending) "Close CK3 and restore settings before a normal launch or profile change."
+                else "Or pick a mode and launch it yourself for a closer look.", color = TextMuted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onAction(FsrMeasurementAction.Compare) }, enabled = ready && !busy && !gameRunning && !pending) { Text("Run comparison") }
+                OutlinedButton(onClick = { onAction(FsrMeasurementAction.Start) }, enabled = ready && !busy && !gameRunning) { Text("Launch mode") }
+                OutlinedButton(onClick = { onAction(FsrMeasurementAction.Capture) }, enabled = pending && gameRunning && !busy) { Text("Record 30 seconds") }
+                OutlinedButton(onClick = { onAction(FsrMeasurementAction.Restore) }, enabled = pending && !gameRunning && !busy) { Text("Restore settings") }
+                TextButton(onClick = onReports, enabled = !busy) { Text("Reports") }
+            }
         }
     }
 }

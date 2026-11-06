@@ -1,6 +1,6 @@
 <?xml version="1.0" ?>
 <jpackage-state version="21.0.2" platform="windows">
-  <app-version>1.0.0</app-version>
+  <app-version>1.0.7</app-version>
   <main-launcher>CK3 DLSS Installer</main-launcher>
   <main-class>com.ck3dlss.installer.MainKt</main-class>
   <signed>false</signed>

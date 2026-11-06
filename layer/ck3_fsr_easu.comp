@@ -1,0 +1,28 @@
+#version 450
+// FSR 1 EASU edge-adaptive upscale, using AMD's MIT-licensed headers in ffx_fsr1/.
+// Rebuild: glslangValidator -V --vn kEasuSpv layer\ck3_fsr_easu.comp -o layer\ck3_fsr_easu.spv.h
+#extension GL_GOOGLE_include_directive : require
+#define A_GPU 1
+#define A_GLSL 1
+#define FSR_EASU_F 1
+#include "ffx_fsr1/ffx_a.h"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D inputColor;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D outputColor;
+layout(push_constant) uniform Constants { uvec4 con0, con1, con2, con3; uvec4 size; } c;
+
+AF4 FsrEasuRF(AF2 p) { return textureGather(inputColor, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(inputColor, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(inputColor, p, 2); }
+
+#include "ffx_fsr1/ffx_fsr1.h"
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= c.size.x || pixel.y >= c.size.y) return;
+    AF3 color;
+    FsrEasuF(color, pixel, c.con0, c.con1, c.con2, c.con3);
+    imageStore(outputColor, ivec2(pixel), vec4(color, 1.0));
+}

@@ -15,6 +15,12 @@ import kotlin.io.path.name
 
 enum class ProfileTag(val label: String) { RECOMMENDED("Recommended"), PREVIEW("Preview"), EXPERIMENTAL("Experimental") }
 
+enum class FsrGpuMode(val label: String) {
+    Native("Native 1080p"), Off("720p, game upscale"), Dedicated("FSR 3.1 on NVIDIA"), Integrated("FSR on Vega")
+}
+
+enum class FsrMeasurementAction { Start, Capture, Compare, Restore }
+
 enum class InstallProfile(
     val scriptValue: String,
     val title: String,
@@ -220,6 +226,57 @@ class InstallerBackend(
 
     fun isGameRunning(): Boolean = gameRunningCheck()
 
+    fun measurementReady(): Boolean = listOf(
+        "CK3-FSR-Measurement.ps1", "fsr-measurement/ck3-fsr-measure.addon64",
+        "fsr-measurement/layer/VkLayer_ck3_fsr.dll", "fsr-measurement/layer/VkLayer_ck3_fsr.json",
+        "fsr-measurement/ck3-fsr-convert.dll",
+        "fsr-measurement/live_worker.py", "fsr-measurement/python-path.txt",
+        "fsr-measurement/runtime/fsr31/amd_fidelityfx_vk.dll",
+    ).all { packageRoot.resolve(it).isRegularFile() } && runCatching {
+        Path.of(readText(packageRoot.resolve("fsr-measurement/python-path.txt")).trim()).isRegularFile()
+    }.getOrDefault(false)
+
+    fun measurementPending(gameRoot: Path): Boolean {
+        val text = readText(gameRoot.resolve("binaries/fsr-measurements/latest.json"))
+        return text.isNotBlank() && !Regex("\"Status\"\\s*:\\s*\"restored\"", RegexOption.IGNORE_CASE).containsMatchIn(text)
+    }
+
+    fun readMeasurementMode(gameRoot: Path): FsrGpuMode? {
+        if (!measurementPending(gameRoot)) return null
+        val text = readText(gameRoot.resolve("binaries/fsr-measurements/latest.json"))
+        val value = Regex("\"Mode\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+        return FsrGpuMode.entries.firstOrNull { it.name == value }
+    }
+
+    fun buildMeasurementCommand(action: FsrMeasurementAction, mode: FsrGpuMode, gameRoot: Path): List<String> =
+        listOf(findPowerShell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+            packageRoot.resolve("CK3-FSR-Measurement.ps1").toString(), "-Action", action.name,
+            "-Mode", mode.name, "-GameRoot", gameRoot.toString(), "-ToolRoot",
+            packageRoot.resolve("fsr-measurement").toString(), "-CaptureSeconds", "30")
+
+    fun runMeasurement(action: FsrMeasurementAction, mode: FsrGpuMode, gameRoot: Path, onLine: (String) -> Unit): CommandResult {
+        val validation = validateGameRoot(gameRoot.toString())
+        val root = validation.normalizedRoot
+        if (!validation.valid || root == null) return CommandResult(2, validation.message)
+        if (action != FsrMeasurementAction.Capture && isGameRunning()) return CommandResult(3, "Close Crusader Kings III first.")
+        val launches = action == FsrMeasurementAction.Start || action == FsrMeasurementAction.Compare
+        if (launches && !measurementReady()) return CommandResult(2, "Stage the local FSR measurement tools first.")
+        if (launches && readActiveProfile(root) != InstallProfile.DLSS5_EXTENDED)
+            return CommandResult(2, "Install DLSS 5 Extended before measuring with portrait mode.")
+        if (!launches && !measurementPending(root)) return CommandResult(2, "Start a measurement session first.")
+        val process = ProcessBuilder(buildMeasurementCommand(action, mode, root))
+            .directory(packageRoot.toFile()).redirectErrorStream(true).start()
+        process.outputStream.close()
+        process.inputStream.bufferedReader(Charset.defaultCharset()).useLines { it.forEach(onLine) }
+        val exit = process.waitFor()
+        return CommandResult(exit, if (exit != 0) "FSR measurement failed. See details." else when (action) {
+            FsrMeasurementAction.Start -> "CK3 measurement is starting. Load your paused test scene."
+            FsrMeasurementAction.Capture -> "Measurement saved under binaries/fsr-measurements."
+            FsrMeasurementAction.Compare -> "Comparison finished. Results and screenshots are in Reports."
+            FsrMeasurementAction.Restore -> "Previous graphics and portrait settings restored."
+        })
+    }
+
     fun buildPowerShellCommand(
         action: InstallerAction,
         profile: InstallProfile,
@@ -283,6 +340,7 @@ class InstallerBackend(
 
     fun launchGame(gameRoot: Path, onLine: (String) -> Unit): CommandResult {
         if (isGameRunning()) return CommandResult(3, "Crusader Kings III is already running.")
+        if (measurementPending(gameRoot)) return CommandResult(3, "Restore measurement settings before a normal launch.")
         val validationResult = runAction(InstallerAction.VALIDATE, InstallProfile.DLSS45, gameRoot, onLine)
         if (!validationResult.succeeded) return validationResult
 
@@ -513,7 +571,7 @@ class InstallerBackend(
 
         /** Turns a raw script line into a short step description, or null for detail-only lines. */
         fun friendlyStep(line: String): String? {
-            val match = Regex("^\\[CK3 DLSS(?: [a-z]+)?\\]\\s*(.+)$").find(line.trim()) ?: return null
+            val match = Regex("^\\[CK3 (?:DLSS(?: [a-z]+)?|FSR)\\]\\s*(.+)$").find(line.trim()) ?: return null
             return match.groupValues[1].trim().takeIf(String::isNotEmpty)
         }
 

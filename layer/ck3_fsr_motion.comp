@@ -1,0 +1,24 @@
+#version 450
+// Camera motion for FSR: where each pixel of the world was on screen last frame, from its depth and the
+// game's camera matrices. Vectors are in render-size pixels and point from the current pixel to the previous one.
+// Screen and depth conventions follow ViewSpacePosFromDepth in the game's gfx/FX/cw/camera.fxh.
+// Rebuild: glslangValidator -V --vn kCameraMotionSpv layer\ck3_fsr_motion.comp -o layer\ck3_fsr_motion.spv.h
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D depthTexture;
+layout(set = 0, binding = 1, rg16f) writeonly uniform image2D motion;
+layout(push_constant, row_major) uniform Constants {
+    mat4 reproject;   // previous view-projection * inverse current view-projection
+    vec2 size;
+} c;
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(c.size.x) || pixel.y >= int(c.size.y)) return;
+    const vec2 uv = (vec2(pixel) + 0.5) / c.size;
+    const float depth = texelFetch(depthTexture, pixel, 0).r;
+    const vec4 previous = c.reproject * vec4(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
+    const vec2 ndc = previous.xy / previous.w;
+    const vec2 previousUv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    imageStore(motion, pixel, vec4((previousUv - uv) * c.size, 0.0, 0.0));
+}

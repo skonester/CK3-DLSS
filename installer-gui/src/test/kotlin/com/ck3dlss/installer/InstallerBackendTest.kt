@@ -29,6 +29,43 @@ class InstallerBackendTest {
         }
 
     @Test
+    fun measurementCommandKeepsPathsAsSeparateArguments() {
+        val pkg = packageRoot()
+        val game = gameRoot()
+        val backend = InstallerBackend(pkg) { false }
+        val command = backend.buildMeasurementCommand(FsrMeasurementAction.Start, FsrGpuMode.Integrated, game)
+        assertTrue(command.windowedContains("-Action", "Start"))
+        assertTrue(command.windowedContains("-Mode", "Integrated"))
+        assertTrue(command.windowedContains("-GameRoot", game.toString()))
+        assertTrue(command.windowedContains("-ToolRoot", pkg.resolve("fsr-measurement").toString()))
+        assertTrue(command.contains("-NonInteractive"))
+        assertFalse(backend.measurementReady())
+    }
+
+    @Test
+    fun measurementCannotChangeSettingsWhileGameRuns() {
+        val backend = InstallerBackend(packageRoot()) { true }
+        val result = backend.runMeasurement(FsrMeasurementAction.Start, FsrGpuMode.Integrated, gameRoot()) { }
+        assertFalse(result.succeeded)
+        assertTrue(result.summary.contains("Close Crusader Kings"))
+    }
+
+    @Test
+    fun normalLaunchRequiresMeasurementRestore() {
+        val backend = InstallerBackend(packageRoot()) { false }
+        val game = gameRoot()
+        val receipt = game.resolve("binaries/fsr-measurements/latest.json")
+        receipt.parent.createDirectories()
+        receipt.writeText("""{"Status":"running","Mode":"Dedicated"}""")
+        assertTrue(backend.measurementPending(game))
+        assertEquals(FsrGpuMode.Dedicated, backend.readMeasurementMode(game))
+        assertTrue(backend.launchGame(game) { }.summary.contains("Restore measurement"))
+        receipt.writeText("""{"Status":"restored"}""")
+        assertFalse(backend.measurementPending(game))
+        assertNull(backend.readMeasurementMode(game))
+    }
+
+    @Test
     fun acceptsGameRootAndBinariesFolder() {
         val game = gameRoot()
         val backend = InstallerBackend(packageRoot())
